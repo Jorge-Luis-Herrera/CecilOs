@@ -7,7 +7,7 @@ Este documento detalla la hoja de ruta técnica para la implementación de los s
 ## 1. Microservicio: Cecil-Ear (Wake Word Engine)
 *Módulo de escucha pasiva de ultra bajo consumo.*
 
-- [ ] **Selección de Motor:** Implementar motor KWS (Keyword Spotting).
+- [X] **Selección de Motor:** Implementar motor KWS (Keyword Spotting).
     - *Opción A:* Porcupine (Picovoice) - Más eficiente.
     - *Opción B:* OpenWakeWord (ONNX Runtime).
 - [ ] **Subprogramas:**

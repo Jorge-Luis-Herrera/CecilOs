@@ -1,0 +1,59 @@
+# Virtual Environments
+env/
+venv/
+.env/
+/Cecil-Ear/moonshine/python/env/
+
+# Build artifacts
+build/
+bin/
+obj/
+/Cecil-Ear/moonshine/core/build/
+/Cecil-Ear/moonshine/python/build/
+*.so
+*.dylib
+*.dll
+*.a
+*.o
+
+# Model weighting and binary data
+*.ort
+*.onnx
+*.bin
+*.weights.h5
+/Cecil-Ear/moonshine/test-assets/
+.cache/
+
+# Audio Files
+*.wav
+*.mp3
+*.flac
+
+# IDE and System Files
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Android and Gradle
+.gradle/
+local.properties
+*.iml
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.externalNativeBuild
+.cxx
+captures/
+output.json
+
+# Project Specific
+tasks.json
+out.txt
+bench.txt
+Cecil-Ear/moonshine/python/src/moonshine_voice/libmoonshine.so
+/Cecil-Ear/moonshine/python/test.ipynb
