@@ -153,7 +153,7 @@ class Transcriber:
         Transcribe audio data without streaming.
 
         Args:
-            audio_data: List of audio samples (PCM float, -1.0 to 1.0)
+            audio_data: List of audio samples or numpy array (PCM float, -1.0 to 1.0)
             sample_rate: Sample rate in Hz (default: 16000)
             flags: Flags for transcription (default: 0)
 
@@ -163,9 +163,26 @@ class Transcriber:
         if self._handle is None:
             raise MoonshineError("Transcriber is not initialized")
 
-        # Convert audio data to ctypes array
-        audio_array = (ctypes.c_float * len(audio_data))(*audio_data)
+        # Convert audio data to ctypes array efficiently
         audio_length = len(audio_data)
+        
+        # Check if it's a numpy array to avoid expensive conversions
+        if hasattr(audio_data, "__array_interface__"):
+            # Ensure it's float32 and 1D
+            import numpy as np
+            audio_np = np.ascontiguousarray(audio_data, dtype=np.float32)
+            audio_array = audio_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        elif isinstance(audio_data, (list, tuple)):
+            # Fallback for lists, but use from_buffer if possible or at least avoid * unpacking
+            import array
+            audio_array = (ctypes.c_float * audio_length).from_buffer(array.array('f', audio_data))
+        else:
+            # Try to use as a buffer directly
+            try:
+                audio_array = (ctypes.c_float * audio_length).from_buffer(audio_data)
+            except Exception:
+                # Last resort (can be slow/crash for very large data)
+                audio_array = (ctypes.c_float * audio_length)(*audio_data)
 
         # Prepare output transcript pointer
         out_transcript = ctypes.POINTER(TranscriptC)()
