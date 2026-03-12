@@ -5,7 +5,7 @@ CecilOs — Asistente de Escritorio con Voz.
 Modos de operación:
   1. GUI manual: escribe un comando → ejecuta
   2. Push-to-talk: click 🎙️ → graba → transcribe → ejecuta
-  3. Always-on: "Hola Cecil" → escucha comando → ejecuta → responde con voz
+  3. Always-on: "Cecilia" → escucha comando → ejecuta → responde con voz
      - "Detente" cancela la acción en curso
      - Se detiene cuando dejas de hablar (~2-3s silencio, VAD automático)
 
@@ -50,7 +50,7 @@ logger = logging.getLogger("cecil")
 
 # Wake word patterns (case-insensitive)
 _WAKE_PATTERNS = re.compile(
-    r"\b(?:hola\s+cecil|oye\s+cecil|hey\s+cecil|cecil)\b", re.IGNORECASE
+    r"\b(?:cecilia)\b", re.IGNORECASE
 )
 # Stop command patterns
 _STOP_PATTERNS = re.compile(
@@ -124,7 +124,7 @@ class AlwaysOnListener:
     - No manual chunking needed — VAD handles everything
 
     States:
-        SLEEPING  → waiting for wake word ("Hola Cecil")
+        SLEEPING  → waiting for wake word ("Cecilia")
         LISTENING → wake word detected, capturing next command
         EXECUTING → running command, listening for "detente"
     """
@@ -464,7 +464,7 @@ class CecilApp:
         self._log(f"  Validator: {val_s}", self.SUBTEXT)
         self._log(f"  Brain:   L0.5 + L1 + L2 + L3 — {brain_s}", self.SUBTEXT)
         self._log("", self.TEXT)
-        self._log("Tip: Activa 'Always-on' y di \"Hola Cecil\"", self.SUBTEXT)
+        self._log("Tip: Activa 'Always-on' y di \"Cecilia\"", self.SUBTEXT)
         self._log("", self.TEXT)
 
     def _build_ui(self):
@@ -636,7 +636,7 @@ class CecilApp:
         self._always_on = True
         self._update_always_on_button()
         self._log("🎙️ Modo always-on activado", self.GREEN)
-        self._log("  Di \"Hola Cecil\" para activar", self.SUBTEXT)
+        self._log("  Di \"Cecilia\" para activar", self.SUBTEXT)
 
     def _stop_always_on(self):
         """Stop always-on listening."""
@@ -657,7 +657,7 @@ class CecilApp:
             self.btn_always_on.configure(
                 bg=self.GREEN, fg="#1e1e2e", text="🔊 ON",
             )
-            self.always_on_status.set("🟢 Escuchando... di \"Hola Cecil\"")
+            self.always_on_status.set("🟢 Escuchando... di \"Cecilia\"")
         else:
             self.btn_always_on.configure(
                 bg=self.SURFACE, fg=self.GREEN, text="🔇 OFF",
