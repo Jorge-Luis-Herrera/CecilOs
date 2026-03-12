@@ -34,6 +34,7 @@ from cecil_brain.keybindings import keybindings_to_context
 from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
 from cecil_brain.resolver import UIResolver  # Phase 2: Coordinate resolution
 from cecil_brain.decomposer import decompose as decompose_command  # Phase 3: Task decomposition
+from cecil_brain.validator import RollingValidator, ValidationEvent, make_validator  # Phase 4: Rolling validation
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -362,6 +363,12 @@ class CecilApp:
         self.tts = CecilVoice()
         self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
         self.resolver = UIResolver()     # Phase 2: Coordinate resolver (AT-SPI2 + OCR)
+        self.validator = make_validator(   # Phase 4: Rolling background validation
+            self.skill_cache,
+            interval_s=3600,
+            batch_size=10,
+            on_event=self._on_validation_event,
+        )
 
         # Voice
         self._model_dir = self._find_stt_model()
@@ -409,7 +416,9 @@ class CecilApp:
         self._log(f"  Vision:  AT-SPI2={'✓' if self.vision_parser._has_atspi else '✗'}  OCR={'✓' if self.vision_parser._has_tesseract else '✗'}", self.SUBTEXT)
         brain_s = f"Qwen ({os.path.basename(self.brain._model_path)})" if self.brain.available else "No disponible"
         cache_s = f"SQLite+JSON ({self.skill_cache.count} skills cached)" if self.skill_cache else "Deshabilitado"
+        val_s   = f"Rolling (interval=1h, batch=10)" if self.validator and self.validator.running else "Deshabilitado"
         self._log(f"  Cache:   {cache_s}", self.SUBTEXT)
+        self._log(f"  Validator: {val_s}", self.SUBTEXT)
         self._log(f"  Brain:   L0.5 + L1 + L2 + L3 — {brain_s}", self.SUBTEXT)
         self._log("", self.TEXT)
         self._log("Tip: Activa 'Always-on' y di \"Hola Cecil\"", self.SUBTEXT)
@@ -1335,14 +1344,26 @@ class CecilApp:
         self._busy = False
         self._cancel_flag.clear()
 
-        # Resume always-on listener → back to sleeping
-        if self.listener and self.listener.running:
-            self.listener.state = AlwaysOnListener.STATE_SLEEPING
-            self._update_always_on_button()
+    # ── Validator callbacks (Phase 4) ─────────────────────
 
-        # Speak response via TTS (non-blocking)
-        if tts_msg and self.tts.available:
-            self.tts.speak_async(tts_msg)
+    def _on_validation_event(self, event: ValidationEvent) -> None:
+        """
+        Receives ValidationEvent from the background validator thread.
+        Logs notable events to the GUI terminal (non-blocking via root.after).
+        """
+        if event.result == "ok":
+            return  # Silent for healthy skills — avoid log noise
+
+        if event.result == "degraded":
+            msg = f"  ⚠ Validator: skill {event.skill_id[:8]}… degradada ({event.reason})"
+            color = self.YELLOW
+        elif event.result == "invalid":
+            msg = f"  ✗ Validator: skill {event.skill_id[:8]}… eviccionada ({event.reason})"
+            color = self.RED
+        else:
+            return  # "skipped" — nothing to log
+
+        self.root.after(0, lambda m=msg, c=color: self._log(m, c))
 
 
 # ── Main ──────────────────────────────────────────────────
@@ -1355,6 +1376,8 @@ if __name__ == "__main__":
     def on_closing():
         if app.listener:
             app.listener.stop()
+        if app.validator and app.validator.running:
+            app.validator.stop(timeout=2.0)
         app.tts.stop()
         root.destroy()
 
