@@ -36,6 +36,10 @@ from cecil_brain.resolver import UIResolver  # Phase 2: Coordinate resolution
 from cecil_brain.decomposer import decompose as decompose_command  # Phase 3: Task decomposition
 from cecil_brain.validator import RollingValidator, ValidationEvent, make_validator  # Phase 4: Rolling validation
 from cecil_brain.confidence import score_action, CONFIRM_THRESHOLD              # Phase 6: Confidence scoring
+from cecil_brain.self_correction import (                                        # Phase 7: Self-correction
+    SelfCorrector, RetryStrategy, CorrectionResult,
+    suggest_layer_escalation, TERMINAL_FALLBACKS,
+)
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -364,6 +368,7 @@ class CecilApp:
         self.tts = CecilVoice()
         self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
         self.resolver = UIResolver()     # Phase 2: Coordinate resolver (AT-SPI2 + OCR)
+        self.corrector = SelfCorrector()   # Phase 7: Self-correction loop
         self.validator = make_validator(   # Phase 4: Rolling background validation
             self.skill_cache,
             interval_s=3600,
@@ -867,82 +872,230 @@ class CecilApp:
 
         Converts task_type + args into a natural-language command and runs it,
         or directly executes known task types without LLM involvement.
+
+        Self-correction (Phase 7):
+        - Terminal / app failures try alternatives before escalating.
+        - Typing / command failures get one free retry (transient lag).
+        - L1 failures automatically escalate to L2 instead of silently failing.
         """
         task_type = subtask.task_type
         args = subtask.args
 
-        # Fast-path: directly execute well-known task types
+        # ── open_terminal: cycle through TERMINAL_FALLBACKS ──────────────
         if task_type == "open_terminal":
-            return self.executor.launch_app("kitty") or self.executor.launch_app("gnome-terminal")
+            current_terminal = TERMINAL_FALLBACKS[0]
+            for attempt in range(SelfCorrector.MAX_ATTEMPTS):
+                ok = self.executor.launch_app(current_terminal)
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "open_terminal", {"app": current_terminal}, attempt, "launch_failed"
+                )
+                if correction.strategy == RetryStrategy.TRY_ALTERNATIVE:
+                    next_term = correction.alternative_args.get("app", current_terminal)
+                    self.root.after(0, lambda o=current_terminal, n=next_term: self._log(
+                        f"  ↩ Corrección: '{o}' falló → intentando '{n}'", self.YELLOW))
+                    current_terminal = next_term
+                elif correction.strategy == RetryStrategy.ESCALATE_L2:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: terminales agotados → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
+                else:
+                    break
+            return False
 
+        # ── open_app: try app aliases ─────────────────────────────────────
         if task_type == "open_app":
             app = args.get("app", "")
-            return self.executor.launch_app(app) if app else False
+            if not app:
+                return False
+            current_app = app
+            for attempt in range(SelfCorrector.MAX_ATTEMPTS):
+                ok = self.executor.launch_app(current_app)
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "open_app", {"app": current_app}, attempt, "launch_failed"
+                )
+                if correction.strategy == RetryStrategy.TRY_ALTERNATIVE:
+                    next_app = correction.alternative_args.get("app", current_app)
+                    self.root.after(0, lambda o=current_app, n=next_app: self._log(
+                        f"  ↩ Corrección: '{o}' no encontrado → intentando '{n}'", self.YELLOW))
+                    current_app = next_app
+                elif correction.needs_escalation:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: app no encontrada → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
+                else:
+                    break
+            return False
 
+        # ── run_command: retry once on transient failure ──────────────────
         if task_type == "run_command":
             cmd = args.get("cmd", "")
-            if cmd:
-                # Type the command in the active terminal + press Enter
+            if not cmd:
+                return False
+            for attempt in range(SelfCorrector.MAX_ATTEMPTS):
                 ok = self.executor.type_text(cmd, delay=0.03)
                 if ok:
                     time.sleep(0.1)
                     ok = self.executor.press_keys("Return")
-                return ok
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "run_command", args, attempt, "type_failed"
+                )
+                if correction.strategy == RetryStrategy.RETRY_SAME:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: error al escribir comando — reintentando", self.YELLOW))
+                    time.sleep(0.3)
+                elif correction.needs_escalation:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: run_command → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
+                else:
+                    break
             return False
 
+        # ── compile: retry once, then escalate to L2 ─────────────────────
         if task_type == "compile":
             cmd = args.get("cmd", "")
-            if cmd:
+            if not cmd:
+                return False
+            for attempt in range(SelfCorrector.MAX_ATTEMPTS):
                 ok = self.executor.type_text(cmd, delay=0.03)
                 if ok:
                     time.sleep(0.1)
                     ok = self.executor.press_keys("Return")
-                return ok
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "compile", args, attempt, "type_failed"
+                )
+                if correction.strategy == RetryStrategy.RETRY_SAME:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: error de escritura en compilación — reintentando", self.YELLOW))
+                    time.sleep(0.3)
+                elif correction.needs_escalation:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: compile → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
+                else:
+                    break
             return False
 
+        # ── type_text: retry once (ydotool lag) ──────────────────────────
         if task_type == "type_text":
             text = args.get("text", "")
-            return self.executor.type_text(text, delay=0.04) if text else False
+            if not text:
+                return False
+            for attempt in range(SelfCorrector.MAX_ATTEMPTS):
+                ok = self.executor.type_text(text, delay=0.04)
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "type_text", args, attempt, "type_failed"
+                )
+                if correction.strategy == RetryStrategy.RETRY_SAME:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: error de escritura — reintentando", self.YELLOW))
+                    time.sleep(0.3)
+                elif correction.strategy == RetryStrategy.ESCALATE_L3:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: type_text → escalando L3 (Vision)", self.YELLOW))
+                    self._run_layer3(subtask.command)
+                    return True  # async
+                else:
+                    break
+            return False
 
+        # ── create_file: escalate to L2 on failure ───────────────────────
         if task_type == "create_file":
             filename = args.get("filename", "")
             content = args.get("content", "")
             if filename and content:
-                # Write file via terminal: printf '...' > filename
                 escaped = content.replace("'", "'\"'\"'")
                 cmd = f"printf '{escaped}' > {filename}"
                 ok = self.executor.type_text(cmd, delay=0.02)
                 if ok:
                     time.sleep(0.1)
                     ok = self.executor.press_keys("Return")
-                return ok
+                if ok:
+                    return True
+                correction = self.corrector.suggest(
+                    "create_file", args, 0, "write_failed"
+                )
+                if correction.needs_escalation:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: create_file → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
             return False
 
+        # ── navigate: escalate to L2 on failure ──────────────────────────
         if task_type == "navigate":
             target = args.get("target", "")
-            # Try to open URL/path in browser or file manager
-            return self.executor.launch_app(target) if target else False
+            if not target:
+                return False
+            ok = self.executor.launch_app(target)
+            if not ok:
+                correction = self.corrector.suggest(
+                    "navigate", args, 0, "launch_failed"
+                )
+                if correction.needs_escalation:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: navigate → escalando L2", self.YELLOW))
+                    self._think_and_run_from_layer1(subtask.command)
+                    return True  # async
+            return ok
 
+        # ── close_app: confirm + retry once ──────────────────────────────
         if task_type == "close_app":
             app = args.get("app", "")
             if app:
                 conf = score_action(subtask.command, task_type="close_app", is_cache_hit=False)
                 if conf.needs_confirm:
-                    ok = self._request_confirmation(
+                    confirmed = self._request_confirmation(
                         f"Cerrar '{app}'?",
                         detail=conf.explanation,
                         destructive=conf.is_destructive,
                     )
-                    if not ok:
+                    if not confirmed:
                         return True   # user cancelled — not an execution failure
-            return self.executor.close_window() if app else False
+            if not app:
+                return False
+            ok = self.executor.close_window()
+            if not ok:
+                correction = self.corrector.suggest(
+                    "close_app", args, 0, "close_failed"
+                )
+                if correction.strategy == RetryStrategy.RETRY_SAME:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: close_app — reintentando", self.YELLOW))
+                    time.sleep(0.4)
+                    ok = self.executor.close_window()
+                elif correction.strategy == RetryStrategy.ESCALATE_L3:
+                    self.root.after(0, lambda: self._log(
+                        "  ↩ Corrección: close_app → escalando L3", self.YELLOW))
+                    self._run_layer3(subtask.command)
+                    return True  # async
+            return ok
 
         # Fallback: delegate unknown task_type to full L1-L3 pipeline
         self._think_and_run_from_layer1(subtask.command)
         return True  # result handled async by pipeline
     
     def _think_and_run_from_layer1(self, command: str):
-        """Continue pipeline from Layer 1 (Intent Parser)."""
+        """Continue pipeline from Layer 1 (Intent Parser).
+
+        Phase 7 self-correction:
+        - L1 execution failure → escalate to L2 instead of silently finishing.
+        - L2 execution failure → escalate to L3.
+        """
         # ── Layer 1: Intent Parser ────────────────────────
         intent = parse_intent(command)
 
@@ -971,14 +1124,25 @@ class CecilApp:
 
             ok = self._execute_intent(intent)
 
-            tag = self.GREEN if ok else self.RED
-            sym = "✓" if ok else "✗"
-            msg = f"{action} {'completado' if ok else 'falló'}"
-            self.root.after(0, lambda: self._log(
-                f"  {sym} {msg}", tag))
-            tts_msg = f"Listo, {entity or action}" if ok else f"No pude {action}"
-            self.root.after(0, lambda: self._finish_execution(tts_msg))
-            return
+            if ok:
+                self.root.after(0, lambda: self._log(
+                    f"  ✓ {action} completado", self.GREEN))
+                self.root.after(0, lambda: self._finish_execution(
+                    f"Listo, {entity or action}"))
+                return
+
+            # L1 intent failed → self-correction: escalate to L2
+            correction = suggest_layer_escalation(
+                current_layer=1, attempt=0, error="intent_failed"
+            )
+            self.root.after(0, lambda a=action, r=correction.reason: self._log(
+                f"  ✗ {a} falló — {r}", self.YELLOW))
+
+            if correction.strategy == RetryStrategy.ABORT or not self.brain.available:
+                self.root.after(0, lambda a=action: self._finish_execution(
+                    f"No pude {a}"))
+                return
+            # Fall through to L2 below
 
         # ── Layer 2: LLM action tree (no vision) ─────────
         if not self.brain.available:
@@ -1014,9 +1178,18 @@ class CecilApp:
                 active_app=active_app,
             )
         except Exception as e:
+            # L2 exception → self-correction: escalate to L3
+            correction = suggest_layer_escalation(
+                current_layer=2, attempt=0, error=str(e)
+            )
             self.root.after(0, lambda err=e: self._log(
                 f"  ✗ Error LLM: {err}", self.RED))
-            self.root.after(0, lambda: self._finish_execution("Error generando plan"))
+            if correction.strategy == RetryStrategy.ABORT or not self.brain.available:
+                self.root.after(0, lambda: self._finish_execution("Error generando plan"))
+            else:
+                self.root.after(0, lambda r=correction.reason: self._log(
+                    f"  ↩ Corrección: {r}", self.YELLOW))
+                self._run_layer3(command)
             return
 
         actions = result.get("actions", [])
