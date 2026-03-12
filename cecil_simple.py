@@ -33,6 +33,7 @@ from cecil_brain.intent_parser import parse as parse_intent
 from cecil_brain.keybindings import keybindings_to_context
 from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
 from cecil_brain.resolver import UIResolver  # Phase 2: Coordinate resolution
+from cecil_brain.decomposer import decompose as decompose_command  # Phase 3: Task decomposition
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -734,15 +735,16 @@ class CecilApp:
 
         threading.Thread(target=self._think_and_run, args=(command,), daemon=True).start()
 
-    # ── Four-Layer Pipeline (with Skill Cache) ────────────
+    # ── Five-Layer Pipeline (Cache + Decomposer + L1/L2/L3) ─
 
     def _think_and_run(self, command: str):
         """
-        Four-layer execution pipeline:
-        Layer 0.5: Skill Cache (cached semantic plans) — instantly matched commands
-        Layer 1: Intent Parser (instant, no GPU) — direct OS actions
-        Layer 2: LLM action tree (no vision) — multi-step plans with keybindings
-        Layer 3: Vision + LLM + Keybindings (PRA loop) — in-app GUI interaction
+        Five-layer execution pipeline:
+        Layer 0.5: Skill Cache (cached semantic plans) — instant plan recall
+        Layer 0.7: Task Decomposer — complex commands → ordered atomic sub-tasks
+        Layer 1:   Intent Parser (instant, no GPU) — direct OS actions
+        Layer 2:   LLM action tree (no vision) — multi-step plans with keybindings
+        Layer 3:   Vision + LLM + Keybindings (PRA loop) — in-app GUI interaction
         """
         # ── Layer 0.5: Skill Cache ────────────────────────
         try:
@@ -750,19 +752,18 @@ class CecilApp:
             if cached_skill is not None:
                 self.root.after(0, lambda: self._log(
                     f"  ⚡ L0.5 CACHE HIT → '{cached_skill.command}' ({cached_skill.success_rate:.0%} success)", self.MAUVE))
-                self.root.after(0, lambda: self.status_var.set(f"Ejecutando desde cache..."))
+                self.root.after(0, lambda: self.status_var.set("Ejecutando desde cache..."))
                 self._current_skill_id = cached_skill.id
-                
+
                 self.root.after(0, self.root.iconify)
                 time.sleep(0.5)
-                
+
                 if self._cancel_flag.is_set():
                     self.root.after(0, lambda: self._finish_execution("Cancelado"))
                     return
-                
-                # Execute cached semantic plan
+
                 ok = self._execute_cached_skill(cached_skill)
-                
+
                 if ok:
                     self.skill_cache.record_success(cached_skill.id)
                     self.root.after(0, lambda: self._log("  ✓ Plan en cache ejecutado exitosamente", self.GREEN))
@@ -770,18 +771,132 @@ class CecilApp:
                 else:
                     self.skill_cache.record_failure(cached_skill.id)
                     self.root.after(0, lambda: self._log(
-                        "  🔄 Cache falló → escalando a L1 (Intent Parser)", self.YELLOW))
-                    # Fall through to L1
-                    self._think_and_run_from_layer1(command)
-                
+                        "  🔄 Cache falló → continuando con descomposición", self.YELLOW))
+                    self._decompose_and_run(command)
                 return
         except Exception as e:
             logger.warning(f"Cache lookup error: {e}")
-            # Fall through to L1 if cache fails
-            pass
-        
-        # If no cache hit or cache disabled, proceed to L1
-        self._think_and_run_from_layer1(command)
+
+        # ── Layer 0.7: Task Decomposer ────────────────────
+        self._decompose_and_run(command)
+
+    def _decompose_and_run(self, command: str):
+        """
+        Layer 0.7: Decompose command into atomic sub-tasks, then execute each.
+
+        If composite: executes each sub-task in order through the full L1-L3 pipeline,
+        so each sub-task benefits from cache, intent parser, and LLM.
+
+        If single/passthrough: falls directly into L1-L3 as before.
+        """
+        try:
+            result = decompose_command(command)
+        except Exception as e:
+            logger.warning(f"Decomposer error: {e}")
+            self._think_and_run_from_layer1(command)
+            return
+
+        if result.is_composite:
+            n = len(result.subtasks)
+            self.root.after(0, lambda: self._log(
+                f"  🧩 L0.7 DESCOMPOSICIÓN → {n} sub-tareas ({result.decomposition_method}, {result.confidence:.0%})",
+                self.MAUVE))
+
+            all_ok = True
+            for subtask in result.subtasks:
+                if self._cancel_flag.is_set():
+                    self.root.after(0, lambda: self._finish_execution("Cancelado"))
+                    return
+
+                self.root.after(0, lambda st=subtask: self._log(
+                    f"  ▸ [{st.order+1}/{n}] {st.task_type}: \"{st.command}\"", self.BLUE))
+
+                # Each sub-task runs through the full pipeline (cache → L1 → L2 → L3)
+                ok = self._run_subtask(subtask)
+
+                if not ok and not subtask.optional:
+                    self.root.after(0, lambda st=subtask: self._log(
+                        f"  ✗ Sub-tarea '{st.task_type}' falló — abortando plan", self.RED))
+                    all_ok = False
+                    break
+
+            msg = "Plan compuesto completado" if all_ok else "Plan compuesto falló"
+            tag = self.GREEN if all_ok else self.RED
+            self.root.after(0, lambda: self._log(f"  {'✓' if all_ok else '✗'} {msg}", tag))
+            self.root.after(0, lambda: self._finish_execution(msg))
+        else:
+            # Single task: pass directly to L1-L3
+            self._think_and_run_from_layer1(command)
+
+    def _run_subtask(self, subtask) -> bool:
+        """
+        Execute a single sub-task through the cache → L1 → L2 → L3 pipeline.
+
+        Converts task_type + args into a natural-language command and runs it,
+        or directly executes known task types without LLM involvement.
+        """
+        task_type = subtask.task_type
+        args = subtask.args
+
+        # Fast-path: directly execute well-known task types
+        if task_type == "open_terminal":
+            return self.executor.launch_app("kitty") or self.executor.launch_app("gnome-terminal")
+
+        if task_type == "open_app":
+            app = args.get("app", "")
+            return self.executor.launch_app(app) if app else False
+
+        if task_type == "run_command":
+            cmd = args.get("cmd", "")
+            if cmd:
+                # Type the command in the active terminal + press Enter
+                ok = self.executor.type_text(cmd, delay=0.03)
+                if ok:
+                    time.sleep(0.1)
+                    ok = self.executor.press_keys("Return")
+                return ok
+            return False
+
+        if task_type == "compile":
+            cmd = args.get("cmd", "")
+            if cmd:
+                ok = self.executor.type_text(cmd, delay=0.03)
+                if ok:
+                    time.sleep(0.1)
+                    ok = self.executor.press_keys("Return")
+                return ok
+            return False
+
+        if task_type == "type_text":
+            text = args.get("text", "")
+            return self.executor.type_text(text, delay=0.04) if text else False
+
+        if task_type == "create_file":
+            filename = args.get("filename", "")
+            content = args.get("content", "")
+            if filename and content:
+                # Write file via terminal: printf '...' > filename
+                escaped = content.replace("'", "'\"'\"'")
+                cmd = f"printf '{escaped}' > {filename}"
+                ok = self.executor.type_text(cmd, delay=0.02)
+                if ok:
+                    time.sleep(0.1)
+                    ok = self.executor.press_keys("Return")
+                return ok
+            return False
+
+        if task_type == "navigate":
+            target = args.get("target", "")
+            # Try to open URL/path in browser or file manager
+            return self.executor.launch_app(target) if target else False
+
+        if task_type == "close_app":
+            app = args.get("app", "")
+            return self.executor.close_window() if app else False
+
+        # Fallback: delegate unknown task_type to full L1-L3 pipeline
+        self._think_and_run_from_layer1(subtask.command)
+        return True  # result handled async by pipeline
     
     def _think_and_run_from_layer1(self, command: str):
         """Continue pipeline from Layer 1 (Intent Parser)."""
