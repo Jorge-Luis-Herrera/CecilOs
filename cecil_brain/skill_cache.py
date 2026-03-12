@@ -23,6 +23,8 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 logger = logging.getLogger("cecil.brain.cache")
 
 
@@ -164,10 +166,18 @@ class SkillCache:
     def save(self, skill: CachedSkill) -> None:
         """
         Save a skill to the cache.
+        If the skill has no embedding yet, generate one now.
 
         Args:
             skill: The CachedSkill to save.
         """
+        if not skill.command_embedding:
+            try:
+                from .embedder import get_embedder
+                skill.command_embedding = get_embedder().encode(skill.command)
+            except Exception as e:
+                logger.warning(f"Embedding generation failed: {e}")
+
         with self._lock:
             if self._use_sqlite:
                 self._save_sqlite(skill)
@@ -247,76 +257,83 @@ class SkillCache:
                 return self._query_fallback(command, threshold)
 
     def _query_sqlite(self, command: str, threshold: float) -> Optional[CachedSkill]:
-        """Query SQLite by keyword matching (simple fallback)."""
+        """Query SQLite using cosine similarity on stored embeddings.
+        Falls back to keyword search if no embeddings are stored."""
         try:
+            # Encode the query command
+            query_vec: Optional[List[float]] = None
+            try:
+                from .embedder import get_embedder, cosine_similarity
+                query_vec = get_embedder().encode(command)
+            except Exception as e:
+                logger.warning(f"Query embedding failed: {e}")
+
             conn = sqlite3.connect(self._db_path)
             cursor = conn.cursor()
-
-            # Simple keyword search (not embedding-based yet)
-            # TODO: integrate with sentence-transformers for real similarity
-            keywords = command.lower().split()
-            if not keywords:
-                return None
-            
-            placeholders = " OR ".join(
-                ["command LIKE ?" for _ in keywords]
-            )
-            query_terms = [f"%{kw}%" for kw in keywords]
-
-            cursor.execute(
-                f"""
-                SELECT * FROM skills
-                WHERE {placeholders}
-                ORDER BY success_count DESC, created_at DESC
-                LIMIT 1
-                """,
-                query_terms,
-            )
-
-            row = cursor.fetchone()
+            cursor.execute("SELECT * FROM skills ORDER BY success_count DESC")
+            rows = cursor.fetchall()
             conn.close()
 
-            if not row:
+            if not rows:
                 return None
 
-            # Parse row back to CachedSkill
-            skill = self._row_to_skill(row)
-            # NOTE: threshold parameter reserved for embedding-based similarity
-            # For now, keyword matches are accepted regardless of success_rate
-            # Success rate is used for ordering/selection, not filtering
-            logger.info(f"Cache hit: {skill.id} (rate: {skill.success_rate:.0%})")
-            return skill
+            best_skill: Optional[CachedSkill] = None
+            best_score: float = -1.0
+
+            for row in rows:
+                skill = self._row_to_skill(row)
+                if query_vec and skill.command_embedding:
+                    score = cosine_similarity(query_vec, skill.command_embedding)
+                else:
+                    # Fallback: Jaccard keyword overlap (no embeddings)
+                    q_kw = set(command.lower().split())
+                    s_kw = set(skill.command.lower().split())
+                    score = len(q_kw & s_kw) / len(q_kw | s_kw) if (q_kw | s_kw) else 0.0
+
+                if score > best_score:
+                    best_score = score
+                    best_skill = skill
+
+            if best_skill is None or best_score < threshold:
+                logger.debug(f"Cache miss (best={best_score:.2f} < threshold={threshold})")
+                return None
+
+            logger.info(f"Cache hit: {best_skill.id!r} score={best_score:.2f} rate={best_skill.success_rate:.0%}")
+            return best_skill
 
         except Exception as e:
             logger.error(f"SQLite query failed: {e}")
             return None
 
     def _query_fallback(self, command: str, threshold: float) -> Optional[CachedSkill]:
-        """Query fallback JSON by keyword overlap (Jaccard similarity)."""
-        keywords = set(command.lower().split())
-        best_match = None
-        best_overlap = 0
+        """Query fallback JSON using cosine similarity (or Jaccard if no embeddings)."""
+        query_vec: Optional[List[float]] = None
+        try:
+            from .embedder import get_embedder, cosine_similarity
+            query_vec = get_embedder().encode(command)
+        except Exception:
+            pass
+
+        best_match: Optional[CachedSkill] = None
+        best_score: float = -1.0
 
         for skill in self._fallback_skills.values():
-            skill_keywords = set(skill.command.lower().split())
-            if not keywords or not skill_keywords:
-                continue
-            
-            # Jaccard similarity: intersection / union
-            overlap = len(keywords & skill_keywords) / len(keywords | skill_keywords)
+            if query_vec and skill.command_embedding:
+                score = cosine_similarity(query_vec, skill.command_embedding)
+            else:
+                q_kw  = set(command.lower().split())
+                s_kw  = set(skill.command.lower().split())
+                score = len(q_kw & s_kw) / len(q_kw | s_kw) if (q_kw | s_kw) else 0.0
 
-            # NOTE: threshold parameter reserved for embedding-based similarity
-            # For now, highest keyword overlap is selected regardless of success_rate
-            # Success rate is used for ordering/selection, not filtering
-            if overlap > best_overlap:
+            if score > best_score:
+                best_score = score
                 best_match = skill
-                best_overlap = overlap
 
-        if best_match:
-            logger.info(f"Cache hit (fallback): {best_match.id} (overlap: {best_overlap:.0%})")
-            return best_match
+        if best_match is None or best_score < threshold:
+            return None
 
-        return None
+        logger.info(f"Cache hit (fallback): {best_match.id!r} score={best_score:.2f}")
+        return best_match
 
     def _row_to_skill(self, row: Tuple) -> CachedSkill:
         """Convert SQLite row to CachedSkill."""
