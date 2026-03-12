@@ -56,6 +56,10 @@ _WAKE_PATTERNS = re.compile(
 _STOP_PATTERNS = re.compile(
     r"\b(?:detente|para|stop|cancela|basta)\b", re.IGNORECASE
 )
+# Shutdown always-on patterns
+_SHUTDOWN_PATTERNS = re.compile(
+    r"\b(?:ap[aá]gate|apagar|cierra|cerrar|desactívate|desactivate)\b", re.IGNORECASE
+)
 
 
 # ── Local LLM Brain (Layer 2 + 3) ────────────────────────
@@ -134,7 +138,7 @@ class AlwaysOnListener:
     STATE_EXECUTING = "executing"
 
     def __init__(self, model_dir: str, on_wake, on_command, on_stop_command,
-                 on_partial_text, on_error):
+                 on_partial_text, on_error, on_shutdown=None):
         """
         Args:
             model_dir: Path to Moonshine model directory.
@@ -150,6 +154,7 @@ class AlwaysOnListener:
         self._on_stop_command = on_stop_command
         self._on_partial_text = on_partial_text
         self._on_error = on_error
+        self._on_shutdown = on_shutdown or (lambda: None)
 
         self._mic = None
         self._state = self.STATE_SLEEPING
@@ -205,6 +210,10 @@ class AlwaysOnListener:
                     state = self._parent._state
 
                     if state == AlwaysOnListener.STATE_SLEEPING:
+                        # Shutdown command works even while sleeping
+                        if _SHUTDOWN_PATTERNS.search(text):
+                            self._parent._on_shutdown()
+                            return
                         # Check for wake word
                         if _WAKE_PATTERNS.search(text):
                             # Extract any command after the wake word
@@ -230,6 +239,10 @@ class AlwaysOnListener:
                     elif state == AlwaysOnListener.STATE_EXECUTING:
                         if _STOP_PATTERNS.search(text):
                             self._parent._on_stop_command()
+                            return
+                        if _SHUTDOWN_PATTERNS.search(text):
+                            self._parent._on_stop_command()
+                            self._parent._on_shutdown()
                             return
 
                 def on_error(self, event):
@@ -631,6 +644,7 @@ class CecilApp:
             on_stop_command=self._on_stop_command,
             on_partial_text=self._on_partial_text,
             on_error=lambda e: self.root.after(0, lambda: self._log(f"✗ {e}", self.RED)),
+            on_shutdown=self._on_shutdown_command,
         )
         self.listener.start()
         self._always_on = True
@@ -695,6 +709,14 @@ class CecilApp:
             self._cancel_flag.set()
             self._log("⏹️ Detente — cancelando acción...", self.YELLOW)
             self.tts.stop()  # Stop any TTS playback too
+        self.root.after(0, _ui)
+
+    def _on_shutdown_command(self):
+        """Called when 'apágate' detected — turns off always-on."""
+        def _ui():
+            self._log("🔇 Apagando always-on...", self.YELLOW)
+            self.tts.speak_async("Hasta luego")
+            self._stop_always_on()
         self.root.after(0, _ui)
 
     def _on_partial_text(self, text: str):
@@ -1584,7 +1606,7 @@ class CecilApp:
             return False
 
     def _finish_execution(self, tts_msg: str = ""):
-        """Restore UI and optionally speak a response."""
+        """Restore UI, speak response, and return always-on to SLEEPING."""
         self.root.deiconify()
         self.root.lift()
 
@@ -1599,6 +1621,16 @@ class CecilApp:
         self.cmd_entry.configure(state=tk.NORMAL)
         self._busy = False
         self._cancel_flag.clear()
+
+        # ── TTS + volver a escuchar ───────────────────────
+        if tts_msg:
+            self.tts.speak_async(tts_msg)
+
+        # Si always-on está activo, volver a SLEEPING para esperar "Cecilia"
+        if self._always_on and self.listener and self.listener.running:
+            self.listener.state = AlwaysOnListener.STATE_SLEEPING
+            self.always_on_status.set("🟢 Escuchando... di \"Cecilia\"")
+            self.status_var.set("🟢 Esperando \"Cecilia\"...")
 
     # ── Validator callbacks (Phase 4) ─────────────────────
 
