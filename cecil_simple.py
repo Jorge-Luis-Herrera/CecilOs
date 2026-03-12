@@ -32,6 +32,7 @@ from cecil_hand.executor import InputExecutor
 from cecil_brain.intent_parser import parse as parse_intent
 from cecil_brain.keybindings import keybindings_to_context
 from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
+from cecil_brain.resolver import UIResolver  # Phase 2: Coordinate resolution
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -359,6 +360,7 @@ class CecilApp:
         self.vision_parser = ScreenParser()
         self.tts = CecilVoice()
         self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
+        self.resolver = UIResolver()     # Phase 2: Coordinate resolver (AT-SPI2 + OCR)
 
         # Voice
         self._model_dir = self._find_stt_model()
@@ -1052,8 +1054,9 @@ class CecilApp:
         """
         Execute a cached semantic skill.
         
-        Converts semantic steps to concrete actions:
-        - SemanticStep(intent="click_button", target="Compile") → Find "Compile" button, click it
+        Converts semantic steps to concrete actions using Phase 2 resolver:
+        - SemanticStep(intent="click_button", target="Compile") 
+          → Resolve "Compile" → (x, y) via AT-SPI2 → Click
         - SemanticStep(intent="type_text", text="hello") → Type the text
         - SemanticStep(intent="key_press", key="Return") → Press the key
         
@@ -1062,23 +1065,44 @@ class CecilApp:
         if not skill or not skill.steps:
             return False
         
+        # Get active app context for resolver
+        active_win = self.executor.get_active_window()
+        active_app = active_win.get("class", "").lower()
+        
         for i, step in enumerate(skill.steps):
             if self._cancel_flag.is_set():
                 return False
             
             try:
                 if step.intent == "click_button":
-                    # Semantic: find button by label, then click
+                    # Phase 2: Resolve semantic target → coordinates
                     if step.target:
-                        # TODO: Use AT-SPI2/OCR to resolve target_label → coordinates
                         self.root.after(0, lambda t=step.target: self._log(
-                            f"    - Clicking button '{t}'...", self.SUBTEXT))
-                        # For now, log it (actual coordinate resolution in Phase 2)
-                        ok = True  # Placeholder: would be actual click via executor
+                            f"    - Resolving button '{t}'...", self.SUBTEXT))
+                        
+                        # Use AT-SPI2 + OCR resolver
+                        element = self.resolver.find_element(step.target, active_app)
+                        
+                        if element:
+                            self.root.after(0, lambda t=step.target, c=element.confidence: self._log(
+                                f"    - Found '{t}' at ({element.x}, {element.y}) [{element.method}, {c:.0%}]", self.SUBTEXT))
+                            
+                            # Click at resolved coordinates
+                            ok = self.executor.click_at(element.x, element.y)
+                        else:
+                            # Phase 2 fallback: Use fallback key combo
+                            if step.fallback:
+                                self.root.after(0, lambda t=step.target, f=step.fallback: self._log(
+                                    f"    - '{t}' not found, using fallback: {f}", self.YELLOW))
+                                ok = self.executor.press_keys(step.fallback)
+                            else:
+                                self.root.after(0, lambda t=step.target: self._log(
+                                    f"    - Could not resolve '{t}' and no fallback available", self.RED))
+                                ok = False
                     elif step.fallback:
-                        # Fallback to key combo
+                        # No target, use fallback
                         self.root.after(0, lambda f=step.fallback: self._log(
-                            f"    - Pressing fallback key: {f}", self.SUBTEXT))
+                            f"    - Using fallback key: {f}", self.SUBTEXT))
                         ok = self.executor.press_keys(step.fallback)
                     else:
                         return False
