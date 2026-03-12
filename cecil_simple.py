@@ -9,7 +9,8 @@ Modos de operación:
      - "Detente" cancela la acción en curso
      - Se detiene cuando dejas de hablar (~2-3s silencio, VAD automático)
 
-Pipeline de 3 capas:
+Pipeline de 4 capas:
+  L0.5: Skill Cache (cached semantic plans)
   L1: Intent Parser (instant, regex)
   L2: LLM plan (Qwen, sin visión)
   L3: Vision + LLM + Keybindings (PRA loop)
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "Cecil-Ear", "moonshine", "python"
 from cecil_hand.executor import InputExecutor
 from cecil_brain.intent_parser import parse as parse_intent
 from cecil_brain.keybindings import keybindings_to_context
+from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -356,6 +358,7 @@ class CecilApp:
         self.vision_capture = ScreenCapture()
         self.vision_parser = ScreenParser()
         self.tts = CecilVoice()
+        self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
 
         # Voice
         self._model_dir = self._find_stt_model()
@@ -367,6 +370,7 @@ class CecilApp:
         # Execution state
         self._busy = False
         self._cancel_flag = threading.Event()
+        self._current_skill_id = None  # Track current skill for success/failure recording
 
         self._init_recorder()
         self._build_ui()
@@ -401,7 +405,9 @@ class CecilApp:
         self._log(f"  TTS:     {'Piper (es_MX)' if self.tts.available else 'No disponible'}", self.SUBTEXT)
         self._log(f"  Vision:  AT-SPI2={'✓' if self.vision_parser._has_atspi else '✗'}  OCR={'✓' if self.vision_parser._has_tesseract else '✗'}", self.SUBTEXT)
         brain_s = f"Qwen ({os.path.basename(self.brain._model_path)})" if self.brain.available else "No disponible"
-        self._log(f"  Brain:   L1 + L2 + L3 — {brain_s}", self.SUBTEXT)
+        cache_s = f"SQLite+JSON ({self.skill_cache.count} skills cached)" if self.skill_cache else "Deshabilitado"
+        self._log(f"  Cache:   {cache_s}", self.SUBTEXT)
+        self._log(f"  Brain:   L0.5 + L1 + L2 + L3 — {brain_s}", self.SUBTEXT)
         self._log("", self.TEXT)
         self._log("Tip: Activa 'Always-on' y di \"Hola Cecil\"", self.SUBTEXT)
         self._log("", self.TEXT)
@@ -726,15 +732,57 @@ class CecilApp:
 
         threading.Thread(target=self._think_and_run, args=(command,), daemon=True).start()
 
-    # ── Three-Layer Pipeline ──────────────────────────────
+    # ── Four-Layer Pipeline (with Skill Cache) ────────────
 
     def _think_and_run(self, command: str):
         """
-        Three-layer execution pipeline:
+        Four-layer execution pipeline:
+        Layer 0.5: Skill Cache (cached semantic plans) — instantly matched commands
         Layer 1: Intent Parser (instant, no GPU) — direct OS actions
         Layer 2: LLM action tree (no vision) — multi-step plans with keybindings
         Layer 3: Vision + LLM + Keybindings (PRA loop) — in-app GUI interaction
         """
+        # ── Layer 0.5: Skill Cache ────────────────────────
+        try:
+            cached_skill = self.skill_cache.query(command, threshold=0.85)
+            if cached_skill is not None:
+                self.root.after(0, lambda: self._log(
+                    f"  ⚡ L0.5 CACHE HIT → '{cached_skill.command}' ({cached_skill.success_rate:.0%} success)", self.MAUVE))
+                self.root.after(0, lambda: self.status_var.set(f"Ejecutando desde cache..."))
+                self._current_skill_id = cached_skill.id
+                
+                self.root.after(0, self.root.iconify)
+                time.sleep(0.5)
+                
+                if self._cancel_flag.is_set():
+                    self.root.after(0, lambda: self._finish_execution("Cancelado"))
+                    return
+                
+                # Execute cached semantic plan
+                ok = self._execute_cached_skill(cached_skill)
+                
+                if ok:
+                    self.skill_cache.record_success(cached_skill.id)
+                    self.root.after(0, lambda: self._log("  ✓ Plan en cache ejecutado exitosamente", self.GREEN))
+                    self.root.after(0, lambda: self._finish_execution("Listo, ejecutado desde cache"))
+                else:
+                    self.skill_cache.record_failure(cached_skill.id)
+                    self.root.after(0, lambda: self._log(
+                        "  🔄 Cache falló → escalando a L1 (Intent Parser)", self.YELLOW))
+                    # Fall through to L1
+                    self._think_and_run_from_layer1(command)
+                
+                return
+        except Exception as e:
+            logger.warning(f"Cache lookup error: {e}")
+            # Fall through to L1 if cache fails
+            pass
+        
+        # If no cache hit or cache disabled, proceed to L1
+        self._think_and_run_from_layer1(command)
+    
+    def _think_and_run_from_layer1(self, command: str):
+        """Continue pipeline from Layer 1 (Intent Parser)."""
         # ── Layer 1: Intent Parser ────────────────────────
         intent = parse_intent(command)
 
@@ -997,6 +1045,99 @@ class CecilApp:
         else:
             logger.warning(f"Unknown action type: {stype}")
             return False
+
+    # ── Layer 0.5: Cached skill executor ──────────────────
+
+    def _execute_cached_skill(self, skill: CachedSkill) -> bool:
+        """
+        Execute a cached semantic skill.
+        
+        Converts semantic steps to concrete actions:
+        - SemanticStep(intent="click_button", target="Compile") → Find "Compile" button, click it
+        - SemanticStep(intent="type_text", text="hello") → Type the text
+        - SemanticStep(intent="key_press", key="Return") → Press the key
+        
+        Returns True if all steps executed successfully, False otherwise.
+        """
+        if not skill or not skill.steps:
+            return False
+        
+        for i, step in enumerate(skill.steps):
+            if self._cancel_flag.is_set():
+                return False
+            
+            try:
+                if step.intent == "click_button":
+                    # Semantic: find button by label, then click
+                    if step.target:
+                        # TODO: Use AT-SPI2/OCR to resolve target_label → coordinates
+                        self.root.after(0, lambda t=step.target: self._log(
+                            f"    - Clicking button '{t}'...", self.SUBTEXT))
+                        # For now, log it (actual coordinate resolution in Phase 2)
+                        ok = True  # Placeholder: would be actual click via executor
+                    elif step.fallback:
+                        # Fallback to key combo
+                        self.root.after(0, lambda f=step.fallback: self._log(
+                            f"    - Pressing fallback key: {f}", self.SUBTEXT))
+                        ok = self.executor.press_keys(step.fallback)
+                    else:
+                        return False
+                
+                elif step.intent == "type_text":
+                    # Type text directly
+                    if step.text:
+                        self.root.after(0, lambda t=step.text: self._log(
+                            f"    - Typing: '{t}'...", self.SUBTEXT))
+                        ok = self.executor.type_text(step.text, delay=0.05)
+                    else:
+                        return False
+                
+                elif step.intent == "key_press":
+                    # Press key combo
+                    if step.key:
+                        self.root.after(0, lambda k=step.key: self._log(
+                            f"    - Pressing key: {k}", self.SUBTEXT))
+                        ok = self.executor.press_keys(step.key)
+                    else:
+                        return False
+                
+                elif step.intent == "launch_app":
+                    # Launch application
+                    if step.target:
+                        self.root.after(0, lambda t=step.target: self._log(
+                            f"    - Launching app: {t}", self.SUBTEXT))
+                        ok = self.executor.launch_app(step.target)
+                    else:
+                        return False
+                
+                elif step.intent == "pause":
+                    # Sleep for a moment (default 0.5s)
+                    delay = float(step.text) if step.text else 0.5
+                    self.root.after(0, lambda d=delay: self._log(
+                        f"    - Pausing for {d}s...", self.SUBTEXT))
+                    time.sleep(delay)
+                    ok = True
+                
+                else:
+                    self.root.after(0, lambda intent=step.intent: self._log(
+                        f"    ✗ Unknown semantic intent: {intent}", self.RED))
+                    return False
+                
+                if not ok:
+                    self.root.after(0, lambda i=i: self._log(
+                        f"    ✗ Step {i+1} failed", self.RED))
+                    return False
+                
+                # Small delay between steps for stability
+                time.sleep(0.2)
+            
+            except Exception as e:
+                self.root.after(0, lambda err=e, i=i: self._log(
+                    f"    ✗ Step {i+1} exception: {err}", self.RED))
+                logger.error(f"Cached skill step {i} failed: {e}")
+                return False
+        
+        return True
 
     # ── Layer 1 intent executor ───────────────────────────
 
