@@ -155,7 +155,7 @@ class AlwaysOnListener:
         self._on_partial_text = on_partial_text
         self._on_error = on_error
         self._on_shutdown = on_shutdown or (lambda: None)
-
+        self._tts_playing = False   # True mientras el TTS habla → ignora mic
         self._mic = None
         self._state = self.STATE_SLEEPING
         self._running = False
@@ -189,50 +189,51 @@ class AlwaysOnListener:
                     text = event.line.text.strip()
                     if not text:
                         return
-
+                    # Ignorar si el TTS está hablando (eco del altavoz)
+                    if self._parent._tts_playing:
+                        return
                     state = self._parent._state
-
-                    # During execution, check for stop command immediately
                     if state == AlwaysOnListener.STATE_EXECUTING:
                         if _STOP_PATTERNS.search(text):
                             self._parent._on_stop_command()
                             return
-
-                    # Show partial text
                     self._parent._on_partial_text(text)
 
                 def on_line_completed(self, event):
-                    """Fires when VAD detects silence after speech (segment done)."""
+                    """Fires cuando el VAD detecta silencio tras habla (segmento completo)."""
                     text = event.line.text.strip()
                     if not text:
+                        return
+                    # Ignorar eco del TTS
+                    if self._parent._tts_playing:
                         return
 
                     state = self._parent._state
 
                     if state == AlwaysOnListener.STATE_SLEEPING:
-                        # Shutdown command works even while sleeping
                         if _SHUTDOWN_PATTERNS.search(text):
                             self._parent._on_shutdown()
                             return
-                        # Check for wake word
                         if _WAKE_PATTERNS.search(text):
-                            # Extract any command after the wake word
                             after = _WAKE_PATTERNS.sub("", text).strip()
                             self._parent.state = AlwaysOnListener.STATE_LISTENING
                             self._parent._on_wake()
                             if after and len(after) > 3:
-                                # Wake word + command in same utterance
                                 self._parent._on_command(after)
                             return
 
                     elif state == AlwaysOnListener.STATE_LISTENING:
-                        # Full command captured
+                        # Filtrar fragmentos cortos (sílabas sueltas, ruido)
+                        if len(text.split()) < 2:
+                            return
+                        if _SHUTDOWN_PATTERNS.search(text):
+                            self._parent._on_shutdown()
+                            return
                         if _STOP_PATTERNS.search(text):
                             self._parent.state = AlwaysOnListener.STATE_SLEEPING
                             return
                         if _WAKE_PATTERNS.search(text):
-                            # Just repeated the wake word, ignore
-                            return
+                            return  # repetición del wake word — ignorar
                         self._parent._on_command(text)
                         return
 
@@ -689,7 +690,7 @@ class CecilApp:
             self.root.deiconify()
             self.root.lift()
             self.root.focus_force()
-            self.tts.speak_async("Dime")
+            self._speak_muted("Dime")
         self.root.after(0, _ui)
 
     def _on_voice_command(self, text: str):
@@ -715,9 +716,28 @@ class CecilApp:
         """Called when 'apágate' detected — turns off always-on."""
         def _ui():
             self._log("🔇 Apagando always-on...", self.YELLOW)
-            self.tts.speak_async("Hasta luego")
+            self._speak_muted("Hasta luego")
             self._stop_always_on()
         self.root.after(0, _ui)
+
+    def _on_partial_text(self, text: str):
+        """
+        Habla con TTS silenciando el listener durante la reproducción.
+        Evita que el mic capture la voz sintetizada como comando.
+        """
+        if not text:
+            return
+
+        def _do_speak():
+            if self.listener:
+                self.listener._tts_playing = True
+            try:
+                self.tts.speak(text)   # bloqueante — espera a que termine
+            finally:
+                if self.listener:
+                    self.listener._tts_playing = False
+
+        threading.Thread(target=_do_speak, daemon=True).start()
 
     def _on_partial_text(self, text: str):
         """Called with live partial transcription."""
@@ -1623,14 +1643,16 @@ class CecilApp:
         self._cancel_flag.clear()
 
         # ── TTS + volver a escuchar ───────────────────────
+        # ── TTS + volver a escuchar ───────────────────────
         if tts_msg:
-            self.tts.speak_async(tts_msg)
+            self._speak_muted(tts_msg)
 
-        # Si always-on está activo, volver a SLEEPING para esperar "Cecilia"
+        # Si always-on está activo, volver directamente a LISTENING
+        # (no hay que repetir "Cecilia" — escucha el siguiente comando de inmediato)
         if self._always_on and self.listener and self.listener.running:
-            self.listener.state = AlwaysOnListener.STATE_SLEEPING
-            self.always_on_status.set("🟢 Escuchando... di \"Cecilia\"")
-            self.status_var.set("🟢 Esperando \"Cecilia\"...")
+            self.listener.state = AlwaysOnListener.STATE_LISTENING
+            self.always_on_status.set("🟡 Escuchando comando...")
+            self.status_var.set("🎙️ Escuchando...")
 
     # ── Validator callbacks (Phase 4) ─────────────────────
 
