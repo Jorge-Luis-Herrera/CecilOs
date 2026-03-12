@@ -35,6 +35,7 @@ from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
 from cecil_brain.resolver import UIResolver  # Phase 2: Coordinate resolution
 from cecil_brain.decomposer import decompose as decompose_command  # Phase 3: Task decomposition
 from cecil_brain.validator import RollingValidator, ValidationEvent, make_validator  # Phase 4: Rolling validation
+from cecil_brain.confidence import score_action, CONFIRM_THRESHOLD              # Phase 6: Confidence scoring
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
@@ -761,6 +762,29 @@ class CecilApp:
             if cached_skill is not None:
                 self.root.after(0, lambda: self._log(
                     f"  ⚡ L0.5 CACHE HIT → '{cached_skill.command}' ({cached_skill.success_rate:.0%} success)", self.MAUVE))
+
+                # ── Phase 6: confidence check ──────────────
+                # Re-query to get the actual similarity score stored by the last query call
+                conf = score_action(
+                    command,
+                    semantic_sim=getattr(cached_skill, '_last_sim', 1.0),
+                    success_rate=cached_skill.success_rate,
+                    is_cache_hit=True,
+                )
+                self.root.after(0, lambda c=conf: self._log(
+                    f"  📊 Confianza: {c.score:.0%}  {c.explanation}",
+                    self.YELLOW if c.needs_confirm else self.SUBTEXT))
+
+                if conf.needs_confirm:
+                    confirmed = self._request_confirmation(
+                        f"Ejecutar: '{cached_skill.command}'?",
+                        detail=conf.explanation,
+                        destructive=conf.is_destructive,
+                    )
+                    if not confirmed:
+                        self.root.after(0, lambda: self._finish_execution("Acción cancelada por el usuario"))
+                        return
+
                 self.root.after(0, lambda: self.status_var.set("Ejecutando desde cache..."))
                 self._current_skill_id = cached_skill.id
 
@@ -901,6 +925,16 @@ class CecilApp:
 
         if task_type == "close_app":
             app = args.get("app", "")
+            if app:
+                conf = score_action(subtask.command, task_type="close_app", is_cache_hit=False)
+                if conf.needs_confirm:
+                    ok = self._request_confirmation(
+                        f"Cerrar '{app}'?",
+                        detail=conf.explanation,
+                        destructive=conf.is_destructive,
+                    )
+                    if not ok:
+                        return True   # user cancelled — not an execution failure
             return self.executor.close_window() if app else False
 
         # Fallback: delegate unknown task_type to full L1-L3 pipeline
@@ -1364,6 +1398,87 @@ class CecilApp:
             return  # "skipped" — nothing to log
 
         self.root.after(0, lambda m=msg, c=color: self._log(m, c))
+
+    # ── Confidence gate (Phase 6) ────────────────────
+
+    def _request_confirmation(
+        self,
+        message: str,
+        detail: str = "",
+        destructive: bool = False,
+    ) -> bool:
+        """
+        Block the calling (worker) thread and show a modal confirmation dialog
+        on the main tkinter thread.  Returns True if the user confirms.
+
+        Uses threading.Event to bridge the worker thread and the GUI thread.
+        """
+        import threading as _th
+        result_event = _th.Event()
+        confirmed_box = [False]  # mutable container accessible from closure
+
+        def _show_dialog():
+            color = self.RED if destructive else self.YELLOW
+            icon  = "⚠️ Acción de riesgo" if destructive else "❓ Confirmación"
+
+            # Log the confirmation request
+            self._log(f"  {icon}: {message}", color)
+            if detail:
+                self._log(f"  {detail}", self.SUBTEXT)
+
+            # Build a simple inline confirm row inside the terminal area
+            frame = tk.Frame(self.root, bg="#313244", pady=6, padx=10)
+            frame.pack(fill=tk.X, padx=20, pady=(0, 6))
+
+            lbl = tk.Label(
+                frame, text=f"{icon}  {message}",
+                bg="#313244",
+                fg=self.RED if destructive else self.YELLOW,
+                font=("Cantarell", 11, "bold"),
+                wraplength=460, justify=tk.LEFT,
+            )
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            def _confirm():
+                confirmed_box[0] = True
+                frame.destroy()
+                result_event.set()
+
+            def _cancel():
+                confirmed_box[0] = False
+                frame.destroy()
+                result_event.set()
+
+            btn_yes = tk.Button(
+                frame, text="✔ Sí",
+                font=("Cantarell", 10, "bold"),
+                bg=self.RED if destructive else self.GREEN,
+                fg="#1e1e2e",
+                relief=tk.FLAT, borderwidth=0,
+                padx=10, pady=3,
+                command=_confirm,
+                cursor="hand2",
+            )
+            btn_yes.pack(side=tk.RIGHT, padx=(4, 0))
+
+            btn_no = tk.Button(
+                frame, text="✘ No",
+                font=("Cantarell", 10),
+                bg="#45475a", fg=self.TEXT,
+                relief=tk.FLAT, borderwidth=0,
+                padx=10, pady=3,
+                command=_cancel,
+                cursor="hand2",
+            )
+            btn_no.pack(side=tk.RIGHT, padx=(0, 4))
+
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+
+        self.root.after(0, _show_dialog)
+        result_event.wait(timeout=30.0)   # auto-cancel after 30 s
+        return confirmed_box[0]
 
 
 # ── Main ──────────────────────────────────────────────────
