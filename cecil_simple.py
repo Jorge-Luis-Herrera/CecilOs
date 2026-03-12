@@ -271,9 +271,24 @@ class AlwaysOnListener:
 
 # ── Audio / STT (Push-to-Talk fallback) ───────────────────
 class PushToTalkRecorder:
-    """Simple push-to-talk: start recording → stop → transcribe."""
+    """
+    Push-to-talk recorder con VAD por energía (RMS).
 
-    SAMPLE_RATE = 16000
+    Comportamiento:
+    - start_recording() abre el micrófono y empieza a acumular audio.
+    - Un hilo interno monitorea el nivel RMS de cada bloque.
+    - Cuando el RMS cae por debajo de SILENCE_THRESHOLD durante
+      SILENCE_SECONDS consecutivos, el hilo llama a on_silence_stop()
+      (callback que el GUI conecta para disparar _stop_record).
+    - stop_and_transcribe() puede seguir llamándose manualmente (botón).
+    - El VAD solo actúa después de que ya se detectó al menos un bloque
+      con habla (evita parar inmediatamente si arrancas en silencio).
+    """
+
+    SAMPLE_RATE       = 16000
+    BLOCKSIZE         = 4096          # ~256 ms por bloque
+    SILENCE_THRESHOLD = 0.015         # RMS mínimo para considerar habla
+    SILENCE_SECONDS   = 3.0           # segundos de silencio antes de parar
 
     def __init__(self, model_dir: str):
         import sounddevice as sd
@@ -285,6 +300,7 @@ class PushToTalkRecorder:
         self._audio_chunks = []
         self._transcriber = None
         self._model_dir = model_dir
+        self.on_silence_stop = None   # callback() → lo conecta el GUI
 
     def _ensure_transcriber(self):
         if self._transcriber is not None:
@@ -297,16 +313,37 @@ class PushToTalkRecorder:
     def start_recording(self):
         self._audio_chunks = []
         self._recording = True
+        self._has_speech = False          # ¿ya se detectó habla?
+        self._silence_accum = 0.0         # segundos acumulados de silencio
+        self._block_duration = self.BLOCKSIZE / self.SAMPLE_RATE  # s/bloque
 
         def callback(indata, frames, time_info, status):
-            if self._recording:
-                self._audio_chunks.append(indata[:, 0].copy())
+            if not self._recording:
+                return
+            chunk = indata[:, 0].copy()
+            self._audio_chunks.append(chunk)
+
+            # ── VAD por energía ──────────────────────────────
+            rms = float(self.np.sqrt(self.np.mean(chunk ** 2)))
+            if rms >= self.SILENCE_THRESHOLD:
+                self._has_speech = True
+                self._silence_accum = 0.0
+            elif self._has_speech:
+                # Solo acumula silencio si ya hubo habla antes
+                self._silence_accum += self._block_duration
+                if self._silence_accum >= self.SILENCE_SECONDS:
+                    # Disparar stop en hilo separado para no bloquear el callback
+                    self._recording = False
+                    if callable(self.on_silence_stop):
+                        threading.Thread(
+                            target=self.on_silence_stop, daemon=True
+                        ).start()
 
         self._stream = self.sd.InputStream(
             samplerate=self.SAMPLE_RATE,
             channels=1,
             dtype="float32",
-            blocksize=4096,
+            blocksize=self.BLOCKSIZE,
             callback=callback,
         )
         self._stream.start()
@@ -691,12 +728,24 @@ class CecilApp:
 
         self._is_recording = True
         self.btn_record.configure(bg=self.RED, fg="#1e1e2e", text="⏹️")
-        self.status_var.set("🔴 Grabando... (click para detener)")
-        self._log("🎙️ Grabando...", self.RED)
+        self.status_var.set("🔴 Grabando... (para al detectar silencio de 3 s)")
+        self._log("🎙️ Grabando — para automáticamente al dejar de hablar...", self.RED)
+
+        # VAD callback: se llama desde el hilo de audio cuando hay 3 s de silencio
+        def _on_vad_silence():
+            if self._is_recording:
+                self.root.after(0, self._stop_record)
+
+        self.recorder.on_silence_stop = _on_vad_silence
         self.recorder.start_recording()
 
+        # Pulsar el botón de nuevo sigue funcionando como stop manual
+
     def _stop_record(self):
+        if not self._is_recording:
+            return  # ya parado (VAD lo disparó antes que el botón)
         self._is_recording = False
+        self.recorder.on_silence_stop = None   # desconectar VAD callback
         self.btn_record.configure(bg=self.SURFACE, fg=self.RED, text="🎙️")
         self.status_var.set("⏳ Transcribiendo...")
         self._log("⏳ Transcribiendo audio...", self.YELLOW)
