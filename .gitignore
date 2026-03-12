@@ -2,6 +2,7 @@
 env/
 venv/
 .env/
+.venv/
 /Cecil-Ear/moonshine/python/env/
 
 # Build artifacts
@@ -19,6 +20,7 @@ obj/
 # Model weighting and binary data
 *.ort
 *.onnx
+!*.onnx.json
 *.bin
 *.weights.h5
 /Cecil-Ear/moonshine/test-assets/
@@ -28,6 +30,10 @@ obj/
 *.wav
 *.mp3
 *.flac
+
+# Temp / backup files
+*.bak
+_test_*.py
 
 # IDE and System Files
 .vscode/
