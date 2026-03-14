@@ -1471,7 +1471,7 @@ class CecilApp:
 
         self.root.after(0, lambda: self.status_var.set("🧠 L3: Analizando pantalla..."))
         self.root.after(0, self.root.iconify)
-        time.sleep(0.5)
+        time.sleep(1.0) # Esperar más tiempo a que Hyprland restaure el focus a la app que hay debajo
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
