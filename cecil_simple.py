@@ -1239,15 +1239,36 @@ class CecilApp:
                     return True  # async
             return False
 
-        # ── navigate: delegate to L2 (OpenClaw) ──────────────────────────
+        # ── navigate: Secuencia nativa directa (Gestores de Archivo / Web) ───────
         if task_type == "navigate":
             target = args.get("target", "")
             if not target:
                 return False
+            
             self.root.after(0, lambda: self._log(
-                f"  Navegación detectada ('{target}') → delegando a L2 (OpenClaw)", self.CYAN))
-            self._think_and_run_from_layer1(subtask.command)
-            return True  # async delegated
+                f"  Navegando hacia '{target}' (Secuencia nativa)...", self.CYAN))
+            
+            # 1. Asegurar no robar el foco de teclado
+            self.root.after(0, self.root.iconify)
+            time.sleep(0.6)  # Dar tiempo a Hyprland a asentar el foco en Nautilus/Browser
+            
+            # 2. Ctrl+L para enfocar la barra de direcciones
+            self.executor.key("ctrl+l")
+            time.sleep(0.4)  # Esperar que la animación de la barra de direcciones termine
+            
+            # 3. Escribir ruta (suele auto-seleccionar y borrar el texto previo)
+            self.executor.type_text(target, delay=0.03)
+            time.sleep(0.3)
+            
+            # 4. Presionar Intro para ir a la ruta
+            ok = self.executor.key("Return")
+            
+            # Validamos si al menos enviamos los comandos con éxito
+            if not ok:
+                 self.root.after(0, lambda: self._log(
+                    "  ⚠ Fallo al inyectar teclas para navegar en la app activa", self.YELLOW))
+                    
+            return ok
 
         # ── close_app: confirm + retry once ──────────────────────────────
         if task_type == "close_app":
@@ -1375,7 +1396,7 @@ class CecilApp:
             if oc_actions:
                 self.root.after(0, lambda n=len(oc_actions): self._log(
                     f"  🦾 OpenClaw → {n} acciones", self.MAUVE))
-                ok = self._execute_plan(oc_actions, "OpenClaw", confirm_each=True)
+                ok = self._execute_plan(oc_actions, "OpenClaw", confirm_plan=True)
                 if ok:
                     msg = "Plan OpenClaw completado" if not self._cancel_flag.is_set() else "Cancelado"
                     self.root.after(0, lambda m=msg: self._finish_execution(m))
@@ -1594,26 +1615,60 @@ class CecilApp:
             self.root.after(0, lambda: self._log("    ✘ Rechazado", self.YELLOW))
         return bool(confirmed)
 
-    def _execute_plan(self, actions: list, layer_tag: str, confirm_each: bool = False) -> bool:
-        """Execute a list of actions. Optionally require voice confirm per step."""
+    def _execute_plan(self, actions: list, layer_tag: str, confirm_plan: bool = False) -> bool:
+        """Execute a list of actions without manual confirmation ensuring mouse focus is correct."""
         self.root.after(0, lambda n=len(actions): self._log(
-            f"  📋 Plan ({layer_tag}): {n} acciones", self.MAUVE))
+            f"  📋 Plan ({layer_tag}): {n} acciones (Auto-ejecución)", self.MAUVE))
+
+        # Always hide the Assistant GUI instantly so it doesn't steal focus
+        self.root.after(0, self.root.iconify)
+        time.sleep(0.5)
+
+        import subprocess
+        import json
 
         for i, step in enumerate(actions):
             if self._cancel_flag.is_set():
                 self.root.after(0, lambda: self._log("  ⏹️ Cancelado", self.YELLOW))
                 return False
 
+            stype = step.get("type") or step.get("action", "")
+            
+            # --- ALGORITMO: Asegurar que el mouse está dentro de la ventana activa en acciones de teclado ---
+            if stype in ["key", "type"]:
+                try:
+                    # 1. Obtener ventana activa actual
+                    win_res = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2)
+                    win_data = json.loads(win_res.stdout) if win_res.stdout.strip() else {}
+                    
+                    if "at" in win_data and "size" in win_data:
+                        wx, wy = win_data["at"]
+                        ww, wh = win_data["size"]
+                        
+                        # 2. Obtener posición del mouse
+                        cur_res = subprocess.run(["hyprctl", "cursorpos", "-j"], capture_output=True, text=True, timeout=2)
+                        cur_data = json.loads(cur_res.stdout) if cur_res.stdout.strip() else {}
+                        
+                        mx, my = cur_data.get("x", 0), cur_data.get("y", 0)
+                        
+                        # 3. Comprobar si el mouse está FUERA de la ventana activa
+                        is_inside = (wx <= mx <= wx + ww) and (wy <= my <= wy + wh)
+                        
+                        if not is_inside:
+                            # Mover al centro para no perder el focus_follows_mouse de Wayland
+                            cx, cy = int(wx + ww / 2), int(wy + wh / 2)
+                            self.root.after(0, lambda: self._log("  🖱️ Auto-corrigiendo posición del mouse al centro de la app", self.SUBTEXT))
+                            self.executor.hover(cx, cy)
+                            time.sleep(0.2)
+                except Exception as e:
+                    pass # Si falla py-hyprctl, seguimos sin crashear el plan
+            # ------------------------------------------------------------------------------------------------
+
             desc = step.get("target", step.get("text",
-                   step.get("key_combo", step.get("type", "?"))))
-            stype = step.get("type", "")
+                   step.get("key_combo", step.get("type", step.get("action", "?")))))
+            
             self.root.after(0, lambda d=desc, n=i, t=stype: self._log(
                 f"    ▶ [{n+1}] {t}: {d}", self.MAUVE))
-
-            if confirm_each:
-                confirmed = self._voice_confirm_action(step, desc)
-                if not confirmed:
-                    return False
 
             ok = self._execute_llm_action(step)
 
