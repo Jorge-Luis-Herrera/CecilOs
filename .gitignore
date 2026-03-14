@@ -63,3 +63,7 @@ out.txt
 bench.txt
 Cecil-Ear/moonshine/python/src/moonshine_voice/libmoonshine.so
 /Cecil-Ear/moonshine/python/test.ipynb
+
+# External subrepos/dirs
+openclaw_src/
+models/
