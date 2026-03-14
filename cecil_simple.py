@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from typing import Any, List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
@@ -43,6 +44,100 @@ from cecil_brain.self_correction import (                                       
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
 from cecil_voice.tts import CecilVoice
+
+
+# ── OpenClaw Planner (agent orchestrator) ───────────────────────────
+
+class OpenClawPlanner:
+    """Wrapper around local openclaw CLI using local gateway."""
+
+    def __init__(self):
+        self.available = False
+        self.last_error = ""
+        self.cli_path = self._find_cli()
+
+    def _find_cli(self) -> str:
+        import shutil
+        candidates = [
+            "openclaw",
+            os.path.expanduser("~/.npm-global/bin/openclaw"),
+            "/usr/local/bin/openclaw"
+        ]
+        for c in candidates:
+            if shutil.which(c) or os.path.isfile(c):
+                return c
+        return ""
+
+    def connect(self) -> bool:
+        if self.cli_path:
+            self.available = True
+            self.last_error = ""
+            return True
+        self.available = False
+        self.last_error = "CLI openclaw no encontrado"
+        return False
+
+    def plan(self, command: str, active_app: str = "", keybindings: str = "") -> Optional[List[dict]]:
+        """Request a plan from OpenClaw CLI. Returns list of actions or None."""
+        if not self.connect():
+            return None
+
+        # Provide a concise tool spec so the remote agent produces executor-friendly steps.
+        tool_spec = (
+            "Available tools (emit JSON array of actions):\n"
+            "- tap(x,y): click at screen coords\n"
+            "- double_click(x,y), right_click(x,y)\n"
+            "- type(text): type literal text\n"
+            "- key(key_combo): press combo like ctrl+c\n"
+            "- scroll(x,y,direction,clicks)\n"
+            "- wait(duration)\n"
+            "- launch_app(app)\n"
+            "Respond ONLY with JSON array of actions matching these fields."
+        )
+
+        context_bits = ["You are the planner for CecilOs. Generate a minimal sequence of GUI actions for the user command."]
+        if active_app:
+            context_bits.append(f"Active app: {active_app}")
+        if keybindings:
+            context_bits.append(f"Keybindings:\n{keybindings}")
+        context_bits.append(f"Command: {command}")
+        context_bits.append(tool_spec)
+        prompt = "\n\n".join(context_bits)
+
+        import subprocess
+        import json
+
+        try:
+            env = os.environ.copy()
+            env["NODE_OPTIONS"] = "--no-warnings"
+            
+            result = subprocess.run(
+                [self.cli_path, "agent", "--session-id", "cecil-local", "--message", prompt, "--json"],
+                capture_output=True, text=True, env=env
+            )
+            
+            if result.returncode != 0:
+                self.last_error = f"openclaw cli fail: {result.stderr}"
+                return None
+                
+            data = json.loads(result.stdout)
+            text = ""
+            for p in data.get("result", {}).get("payloads", []):
+                text += p.get("text", "")
+
+            # Extract first JSON array found in the response
+            start = text.find("[")
+            end = text.rfind("]")
+            if start == -1 or end == -1:
+                return None
+            payload = text[start:end + 1]
+            actions = json.loads(payload)
+            if isinstance(actions, list):
+                return actions
+        except Exception as e:
+            self.last_error = f"openclaw error: {e}"
+            return None
+        return None
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -414,6 +509,7 @@ class CecilApp:
         # Core modules
         self.executor = InputExecutor()
         self.brain = LocalBrain()
+        self.openclaw = OpenClawPlanner()
         self.vision_capture = ScreenCapture()
         self.vision_parser = ScreenParser()
         self.tts = CecilVoice()
@@ -471,9 +567,12 @@ class CecilApp:
         self._log(f"  STT:     {'Moonshine (' + os.path.basename(self._model_dir) + ')' if self._model_dir else 'No disponible'}", self.SUBTEXT)
         self._log(f"  TTS:     {'Piper (es_MX)' if self.tts.available else 'No disponible'}", self.SUBTEXT)
         self._log(f"  Vision:  AT-SPI2={'✓' if self.vision_parser._has_atspi else '✗'}  OCR={'✓' if self.vision_parser._has_tesseract else '✗'}", self.SUBTEXT)
+        oc_ok = self.openclaw.connect()
+        oc_s = "OpenClaw (local)" if oc_ok else f"No disponible ({self.openclaw.last_error or 'sin cliente'})"
         brain_s = f"Qwen ({os.path.basename(self.brain._model_path)})" if self.brain.available else "No disponible"
         cache_s = f"SQLite+JSON ({self.skill_cache.count} skills cached)" if self.skill_cache else "Deshabilitado"
         val_s   = f"Rolling (interval=1h, batch=10)" if self.validator and self.validator.running else "Deshabilitado"
+        self._log(f"  Planner: {oc_s}", self.SUBTEXT)
         self._log(f"  Cache:   {cache_s}", self.SUBTEXT)
         self._log(f"  Validator: {val_s}", self.SUBTEXT)
         self._log(f"  Brain:   L0.5 + L1 + L2 + L3 — {brain_s}", self.SUBTEXT)
@@ -720,24 +819,37 @@ class CecilApp:
             self._stop_always_on()
         self.root.after(0, _ui)
 
-    def _on_partial_text(self, text: str):
+    def _speak_muted(self, text: str):
         """
-        Habla con TTS silenciando el listener durante la reproducción.
-        Evita que el mic capture la voz sintetizada como comando.
+        Reproduce TTS sin que always-on se escuche a sí mismo.
+        Activa un flag temporal para que el listener ignore el micrófono
+        mientras Piper está hablando.
         """
-        if not text:
+        if not text or not self.tts.available:
             return
 
         def _do_speak():
             if self.listener:
                 self.listener._tts_playing = True
             try:
-                self.tts.speak(text)   # bloqueante — espera a que termine
+                self.tts.speak(text)
             finally:
                 if self.listener:
                     self.listener._tts_playing = False
 
         threading.Thread(target=_do_speak, daemon=True).start()
+
+    def _speak_muted_blocking(self, text: str):
+        """Blocking variant used before voice confirmations to avoid echo."""
+        if not text or not self.tts.available:
+            return
+        if self.listener:
+            self.listener._tts_playing = True
+        try:
+            self.tts.speak(text)
+        finally:
+            if self.listener:
+                self.listener._tts_playing = False
 
     def _on_partial_text(self, text: str):
         """Called with live partial transcription."""
@@ -1127,22 +1239,15 @@ class CecilApp:
                     return True  # async
             return False
 
-        # ── navigate: escalate to L2 on failure ──────────────────────────
+        # ── navigate: delegate to L2 (OpenClaw) ──────────────────────────
         if task_type == "navigate":
             target = args.get("target", "")
             if not target:
                 return False
-            ok = self.executor.launch_app(target)
-            if not ok:
-                correction = self.corrector.suggest(
-                    "navigate", args, 0, "launch_failed"
-                )
-                if correction.needs_escalation:
-                    self.root.after(0, lambda: self._log(
-                        "  ↩ Corrección: navigate → escalando L2", self.YELLOW))
-                    self._think_and_run_from_layer1(subtask.command)
-                    return True  # async
-            return ok
+            self.root.after(0, lambda: self._log(
+                f"  Navegación detectada ('{target}') → delegando a L2 (OpenClaw)", self.CYAN))
+            self._think_and_run_from_layer1(subtask.command)
+            return True  # async delegated
 
         # ── close_app: confirm + retry once ──────────────────────────────
         if task_type == "close_app":
@@ -1261,6 +1366,27 @@ class CecilApp:
 
         self.root.after(0, lambda a=active_app: self._log(
             f"  📱 App activa: {a or 'desconocida'}", self.SUBTEXT))
+
+        # ── OpenClaw planner (agent) ─────────────────────
+        try:
+            oc_actions = None
+            if self.openclaw.connect():
+                oc_actions = self.openclaw.plan(command, active_app, kb_context)
+            if oc_actions:
+                self.root.after(0, lambda n=len(oc_actions): self._log(
+                    f"  🦾 OpenClaw → {n} acciones", self.MAUVE))
+                ok = self._execute_plan(oc_actions, "OpenClaw", confirm_each=True)
+                if ok:
+                    msg = "Plan OpenClaw completado" if not self._cancel_flag.is_set() else "Cancelado"
+                    self.root.after(0, lambda m=msg: self._finish_execution(m))
+                    return
+                self.root.after(0, lambda: self._log(
+                    "  ⚠ OpenClaw falló — regresando a L2 local", self.YELLOW))
+            elif self.openclaw.last_error:
+                self.root.after(0, lambda e=self.openclaw.last_error: self._log(
+                    f"  ⚠ OpenClaw no disponible: {e}", self.YELLOW))
+        except Exception as e:
+            self.root.after(0, lambda err=e: self._log(f"  ⚠ OpenClaw error: {err}", self.YELLOW))
 
         try:
             result = self.brain.generate_plan(
@@ -1408,8 +1534,68 @@ class CecilApp:
 
     # ── Shared plan executor ──────────────────────────────
 
-    def _execute_plan(self, actions: list, layer_tag: str) -> bool:
-        """Execute a list of LLM-generated actions. Returns True if all succeeded."""
+    def _listen_for_yes(self, timeout: float = 5.0) -> Optional[bool]:
+        """Listen briefly for a spoken 'sí'. Returns True/False/None on error."""
+        if not self._model_dir:
+            return None
+        try:
+            import sounddevice as sd  # type: ignore
+            import numpy as np  # type: ignore
+            from moonshine_voice import Transcriber, ModelArch
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"  STT confirmación no disponible: {e}", self.YELLOW))
+            return None
+
+        fs = 16000
+        dur = max(1.5, min(timeout, 6.0))
+        try:
+            audio = sd.rec(int(dur * fs), samplerate=fs, channels=1, dtype="float32")
+            sd.wait(dur + 0.5)
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"  Mic no disponible: {e}", self.YELLOW))
+            return None
+
+        data = audio[:, 0].copy() if audio.size else None
+        if data is None or not data.size:
+            return False
+
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        if peak > 0:
+            data = data / peak * 0.9
+
+        try:
+            transcriber = Transcriber(self._model_dir, model_arch=ModelArch.BASE)
+            transcript = transcriber.transcribe_without_streaming(data.tolist(), fs)
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"  Error transcribiendo confirmación: {e}", self.YELLOW))
+            return None
+
+        text_parts = [line.text.strip().lower() for line in transcript.lines if line.text.strip()]
+        if not text_parts:
+            return False
+        text = " ".join(text_parts)
+        if "sí" in text or "si" in text:
+            return True
+        if "no" in text:
+            return False
+        return False
+
+    def _voice_confirm_action(self, step: dict, desc: str) -> bool:
+        """Ask for visual confirmation before executing an action."""
+        question = f"¿Ejecutar {step.get('type', 'acción')}: {desc}?"
+        self.root.after(0, lambda q=question: self._log(f"  🔐 Esperando confirmación: {q}", self.YELLOW))
+
+        # Directamente mostrar la interfaz gráfica de confirmación en lugar de voz
+        confirmed = self._request_confirmation(question)
+
+        if confirmed:
+            self.root.after(0, lambda: self._log("    ✔ Confirmado", self.GREEN))
+        else:
+            self.root.after(0, lambda: self._log("    ✘ Rechazado", self.YELLOW))
+        return bool(confirmed)
+
+    def _execute_plan(self, actions: list, layer_tag: str, confirm_each: bool = False) -> bool:
+        """Execute a list of actions. Optionally require voice confirm per step."""
         self.root.after(0, lambda n=len(actions): self._log(
             f"  📋 Plan ({layer_tag}): {n} acciones", self.MAUVE))
 
@@ -1423,6 +1609,11 @@ class CecilApp:
             stype = step.get("type", "")
             self.root.after(0, lambda d=desc, n=i, t=stype: self._log(
                 f"    ▶ [{n+1}] {t}: {d}", self.MAUVE))
+
+            if confirm_each:
+                confirmed = self._voice_confirm_action(step, desc)
+                if not confirmed:
+                    return False
 
             ok = self._execute_llm_action(step)
 
@@ -1438,8 +1629,13 @@ class CecilApp:
         return True
 
     def _execute_llm_action(self, step: dict) -> bool:
-        """Execute a single action from an LLM-generated plan."""
-        stype = step.get("type", "")
+        """Execute a single action from an LLM-generated plan.
+        
+        Handles both {'type': 'launch_app'} (local LLM) and
+        {'action': 'launch_app'} (OpenClaw CLI) formats.
+        """
+        # Normalise: OpenClaw returns 'action' key, local LLM uses 'type'
+        stype = step.get("type") or step.get("action", "")
 
         if stype == "tap":
             return self.executor.tap(int(step.get("x", 0)), int(step.get("y", 0)))
@@ -1626,7 +1822,7 @@ class CecilApp:
             return False
 
     def _finish_execution(self, tts_msg: str = ""):
-        """Restore UI, speak response, and return always-on to SLEEPING."""
+        """Restore UI, optionally speak, and resume continuous always-on listening."""
         self.root.deiconify()
         self.root.lift()
 
@@ -1643,12 +1839,10 @@ class CecilApp:
         self._cancel_flag.clear()
 
         # ── TTS + volver a escuchar ───────────────────────
-        # ── TTS + volver a escuchar ───────────────────────
         if tts_msg:
             self._speak_muted(tts_msg)
 
-        # Si always-on está activo, volver directamente a LISTENING
-        # (no hay que repetir "Cecilia" — escucha el siguiente comando de inmediato)
+        # Always-on continuo: no hace falta repetir "Cecilia" entre comandos.
         if self._always_on and self.listener and self.listener.running:
             self.listener.state = AlwaysOnListener.STATE_LISTENING
             self.always_on_status.set("🟡 Escuchando comando...")

@@ -242,7 +242,12 @@ class ScreenParser:
 
                 row = dict(zip(headers, fields))
                 text = row.get("text", "").strip()
-                conf = int(row.get("conf", "0"))
+                
+                # Safely parse confidence as float first, then int
+                try:
+                    conf = int(float(row.get("conf", "0")))
+                except ValueError:
+                    conf = 0
 
                 if text and conf > 30:  # Filter low-confidence detections
                     elements.append({
