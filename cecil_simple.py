@@ -30,6 +30,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "Cecil-Ear", "moonshine", "python", "src"))
 
 from cecil_hand.executor import InputExecutor
+from cecil_skills.file_management import FileManagementSkill
 from cecil_brain.intent_parser import parse as parse_intent
 from cecil_brain.keybindings import keybindings_to_context
 from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
@@ -43,6 +44,7 @@ from cecil_brain.self_correction import (                                       
 )
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
+from cecil_brain.enhanced_openclaw_planner import EnhancedOpenClawPlanner
 from cecil_voice.tts import CecilVoice
 
 
@@ -509,11 +511,20 @@ class CecilApp:
         # Core modules
         self.executor = InputExecutor()
         self.brain = LocalBrain()
-        self.openclaw = OpenClawPlanner()
         self.vision_capture = ScreenCapture()
         self.vision_parser = ScreenParser()
-        self.tts = CecilVoice()
         self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
+        self.openclaw = EnhancedOpenClawPlanner(
+            skill_cache=self.skill_cache,
+            vision_parser=self.vision_parser,
+            screen_capture=self.vision_capture
+        )
+        self.file_management_skill = FileManagementSkill(
+            vision_capture=self.vision_capture,
+            vision_parser=self.vision_parser,
+            hand_executor=self.executor
+        )
+        self.tts = CecilVoice()
         self.resolver = UIResolver()     # Phase 2: Coordinate resolver (AT-SPI2 + OCR)
         self.corrector = SelfCorrector()   # Phase 7: Self-correction loop
         self.validator = make_validator(   # Phase 4: Rolling background validation
@@ -1388,26 +1399,44 @@ class CecilApp:
         self.root.after(0, lambda a=active_app: self._log(
             f"  📱 App activa: {a or 'desconocida'}", self.SUBTEXT))
 
-        # ── OpenClaw planner (agent) ─────────────────────
+        # ── Enhanced OpenClaw planner (agent) ─────────────────────
         try:
-            oc_actions = None
+            enhanced_plan = None
             if self.openclaw.connect():
-                oc_actions = self.openclaw.plan(command, active_app, kb_context)
-            if oc_actions:
-                self.root.after(0, lambda n=len(oc_actions): self._log(
-                    f"  🦾 OpenClaw → {n} acciones", self.MAUVE))
-                ok = self._execute_plan(oc_actions, "OpenClaw", confirm_plan=True)
+                enhanced_plan = self.openclaw.plan_with_enhancement(
+                    command, active_app, kb_context
+                )
+            if enhanced_plan and enhanced_plan.get("source") != "error":
+                plan_source = enhanced_plan["source"]
+                actions = enhanced_plan["actions"]
+                
+                # Log plan source and stats
+                stats = self.openclaw.get_stats()
+                self.root.after(0, lambda s=plan_source, n=len(actions): self._log(
+                    f"  🦾 Enhanced OpenClaw ({s}) → {n} acciones", self.MAUVE))
+                self.root.after(0, lambda st=stats: self._log(
+                    f"  📊 Cache hit rate: {st.get('cache_hit_rate', 0):.1%}", self.SUBTEXT))
+                
+                # Execute plan
+                ok = self._execute_plan(actions, f"Enhanced OpenClaw ({plan_source})", confirm_plan=True)
+                
+                # Store execution result for learning
+                self.openclaw.store_execution_result(
+                    plan_source, command, actions, ok and not self._cancel_flag.is_set()
+                )
+                
                 if ok:
-                    msg = "Plan OpenClaw completado" if not self._cancel_flag.is_set() else "Cancelado"
+                    msg = f"Enhanced OpenClaw plan ({plan_source}) completado" if not self._cancel_flag.is_set() else "Cancelado"
                     self.root.after(0, lambda m=msg: self._finish_execution(m))
                     return
-                self.root.after(0, lambda: self._log(
-                    "  ⚠ OpenClaw falló — regresando a L2 local", self.YELLOW))
+                else:
+                    self.root.after(0, lambda: self._log(
+                        "  ⚠ Enhanced OpenClaw falló — regresando a L2 local", self.YELLOW))
             elif self.openclaw.last_error:
                 self.root.after(0, lambda e=self.openclaw.last_error: self._log(
-                    f"  ⚠ OpenClaw no disponible: {e}", self.YELLOW))
+                    f"  ⚠ Enhanced OpenClaw no disponible: {e}", self.YELLOW))
         except Exception as e:
-            self.root.after(0, lambda err=e: self._log(f"  ⚠ OpenClaw error: {err}", self.YELLOW))
+            self.root.after(0, lambda err=e: self._log(f"  ⚠ Enhanced OpenClaw error: {err}", self.YELLOW))
 
         try:
             result = self.brain.generate_plan(
