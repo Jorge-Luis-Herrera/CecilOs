@@ -192,7 +192,7 @@ class LocalBrain:
         self._engine = LLMEngine(
             model_path=self._model_path,
             n_gpu_layers=-1,
-            n_ctx=2048,
+            n_ctx=16384,  # Context window extended to 16K bounds for deep UI layout
             n_threads=4,
             temperature=0.1,
             max_tokens=512,
@@ -1246,7 +1246,7 @@ class CecilApp:
                 return False
             
             self.root.after(0, lambda: self._log(
-                f"  Navegando hacia '{target}' (Secuencia nativa)...", self.CYAN))
+                f"  Navegando hacia '{target}' (Secuencia nativa)...", self.BLUE))
             
             # 1. Asegurar no robar el foco de teclado
             self.root.after(0, self.root.iconify)

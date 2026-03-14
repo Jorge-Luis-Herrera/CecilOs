@@ -124,7 +124,7 @@ class InputExecutor:
             logger.error("No input backend available for tap")
             return False
 
-    def type_text(self, text: str, target_class: str = "") -> bool:
+    def type_text(self, text: str, target_class: str = "", delay: float = 0.03) -> bool:
         """
         Simulate typing text into the focused window.
         If target_class is given, focus that window first.
@@ -132,6 +132,7 @@ class InputExecutor:
         Args:
             text: The text to type.
             target_class: Optional window class to focus first (e.g. "kitty", "firefox").
+            delay: Optional per-key delay in seconds (used by ydotool backend).
 
         Returns:
             True if successful.
@@ -141,12 +142,13 @@ class InputExecutor:
             time.sleep(0.3)
 
         logger.info(f"TYPE: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+        key_delay_ms = max(1, int(delay * 1000))
         # Prefer wtype on Wayland (handles unicode/locale correctly)
         if shutil.which("wtype"):
             return self._run_command(["wtype", text])
         elif self._backend == "ydotool":
             return self._run_command(
-                ["ydotool", "type", "--key-delay", "30", "--", text]
+                ["ydotool", "type", "--key-delay", str(key_delay_ms), "--", text]
             )
         elif self._backend == "xdotool":
             return self._run_command(["xdotool", "type", "--clearmodifiers", text])

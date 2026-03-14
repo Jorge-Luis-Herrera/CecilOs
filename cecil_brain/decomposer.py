@@ -154,9 +154,10 @@ class TaskDecomposer:
         re.IGNORECASE,
     )
     _CONJUNCTION_RE = re.compile(
-        r"\s+(?:y\s+(?:después\s+)?(?:luego\s+)?|luego\s+|después\s+(?:de\s+esto\s+)?|then\s+|and\s+(?:then\s+)?)",
+        r"\s*(?:,|;|\.)?\s+(?:y\s+(?:después\s+)?(?:luego\s+)?|luego\s+|después\s+(?:de\s+esto\s+)?|posteriormente\s+|then\s+|and\s+(?:then\s+)?)",
         re.IGNORECASE,
     )
+    _COMMA_RE = re.compile(r"\s*,\s*")
 
     def decompose(self, command: str) -> DecompositionResult:
         """
@@ -226,8 +227,18 @@ class TaskDecomposer:
 
     def _split_conjunctions(self, command: str) -> List[str]:
         """Split 'X y luego Y' into ['X', 'Y']."""
+        # First split by explicit conjunction words (y, luego, posteriormente)
         parts = self._CONJUNCTION_RE.split(command)
-        return [p.strip() for p in parts if p and p.strip()]
+        
+        # Then also split by isolated commas if they seem to separate actions 
+        # (e.g. "haz esto, haz lo otro")
+        final_parts = []
+        for p in parts:
+            if not p or not p.strip(): continue
+            sub_parts = self._COMMA_RE.split(p)
+            final_parts.extend([sp.strip() for sp in sub_parts if sp and sp.strip()])
+            
+        return final_parts
 
     def _extract_single_task(self, segment: str, order: int = 0) -> Optional[SubTask]:
         """Match a single segment against known patterns."""
