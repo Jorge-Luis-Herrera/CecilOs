@@ -30,6 +30,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "Cecil-Ear", "moonshine", "python", "src"))
 
 from cecil_hand.executor import InputExecutor
+from cecil_skills.file_management import FileManagementSkill
 from cecil_brain.intent_parser import parse as parse_intent
 from cecil_brain.keybindings import keybindings_to_context
 from cecil_brain.skill_cache import SkillCache, CachedSkill, SemanticStep
@@ -43,6 +44,7 @@ from cecil_brain.self_correction import (                                       
 )
 from cecil_vision.capture import ScreenCapture
 from cecil_vision.parser import ScreenParser
+from cecil_brain.enhanced_openclaw_planner import EnhancedOpenClawPlanner
 from cecil_voice.tts import CecilVoice
 
 
@@ -192,7 +194,7 @@ class LocalBrain:
         self._engine = LLMEngine(
             model_path=self._model_path,
             n_gpu_layers=-1,
-            n_ctx=2048,
+            n_ctx=16384,  # Context window extended to 16K bounds for deep UI layout
             n_threads=4,
             temperature=0.1,
             max_tokens=512,
@@ -509,11 +511,20 @@ class CecilApp:
         # Core modules
         self.executor = InputExecutor()
         self.brain = LocalBrain()
-        self.openclaw = OpenClawPlanner()
         self.vision_capture = ScreenCapture()
         self.vision_parser = ScreenParser()
-        self.tts = CecilVoice()
         self.skill_cache = SkillCache()  # Layer 0.5: Semantic skill cache
+        self.openclaw = EnhancedOpenClawPlanner(
+            skill_cache=self.skill_cache,
+            vision_parser=self.vision_parser,
+            screen_capture=self.vision_capture
+        )
+        self.file_management_skill = FileManagementSkill(
+            vision_capture=self.vision_capture,
+            vision_parser=self.vision_parser,
+            hand_executor=self.executor
+        )
+        self.tts = CecilVoice()
         self.resolver = UIResolver()     # Phase 2: Coordinate resolver (AT-SPI2 + OCR)
         self.corrector = SelfCorrector()   # Phase 7: Self-correction loop
         self.validator = make_validator(   # Phase 4: Rolling background validation
@@ -1239,15 +1250,36 @@ class CecilApp:
                     return True  # async
             return False
 
-        # ── navigate: delegate to L2 (OpenClaw) ──────────────────────────
+        # ── navigate: Secuencia nativa directa (Gestores de Archivo / Web) ───────
         if task_type == "navigate":
             target = args.get("target", "")
             if not target:
                 return False
+            
             self.root.after(0, lambda: self._log(
-                f"  Navegación detectada ('{target}') → delegando a L2 (OpenClaw)", self.CYAN))
-            self._think_and_run_from_layer1(subtask.command)
-            return True  # async delegated
+                f"  Navegando hacia '{target}' (Secuencia nativa)...", self.BLUE))
+            
+            # 1. Asegurar no robar el foco de teclado
+            self.root.after(0, self.root.iconify)
+            time.sleep(0.6)  # Dar tiempo a Hyprland a asentar el foco en Nautilus/Browser
+            
+            # 2. Ctrl+L para enfocar la barra de direcciones
+            self.executor.key("ctrl+l")
+            time.sleep(0.4)  # Esperar que la animación de la barra de direcciones termine
+            
+            # 3. Escribir ruta (suele auto-seleccionar y borrar el texto previo)
+            self.executor.type_text(target, delay=0.03)
+            time.sleep(0.3)
+            
+            # 4. Presionar Intro para ir a la ruta
+            ok = self.executor.key("Return")
+            
+            # Validamos si al menos enviamos los comandos con éxito
+            if not ok:
+                 self.root.after(0, lambda: self._log(
+                    "  ⚠ Fallo al inyectar teclas para navegar en la app activa", self.YELLOW))
+                    
+            return ok
 
         # ── close_app: confirm + retry once ──────────────────────────────
         if task_type == "close_app":
@@ -1367,26 +1399,44 @@ class CecilApp:
         self.root.after(0, lambda a=active_app: self._log(
             f"  📱 App activa: {a or 'desconocida'}", self.SUBTEXT))
 
-        # ── OpenClaw planner (agent) ─────────────────────
+        # ── Enhanced OpenClaw planner (agent) ─────────────────────
         try:
-            oc_actions = None
+            enhanced_plan = None
             if self.openclaw.connect():
-                oc_actions = self.openclaw.plan(command, active_app, kb_context)
-            if oc_actions:
-                self.root.after(0, lambda n=len(oc_actions): self._log(
-                    f"  🦾 OpenClaw → {n} acciones", self.MAUVE))
-                ok = self._execute_plan(oc_actions, "OpenClaw", confirm_each=True)
+                enhanced_plan = self.openclaw.plan_with_enhancement(
+                    command, active_app, kb_context
+                )
+            if enhanced_plan and enhanced_plan.get("source") != "error":
+                plan_source = enhanced_plan["source"]
+                actions = enhanced_plan["actions"]
+                
+                # Log plan source and stats
+                stats = self.openclaw.get_stats()
+                self.root.after(0, lambda s=plan_source, n=len(actions): self._log(
+                    f"  🦾 Enhanced OpenClaw ({s}) → {n} acciones", self.MAUVE))
+                self.root.after(0, lambda st=stats: self._log(
+                    f"  📊 Cache hit rate: {st.get('cache_hit_rate', 0):.1%}", self.SUBTEXT))
+                
+                # Execute plan
+                ok = self._execute_plan(actions, f"Enhanced OpenClaw ({plan_source})", confirm_plan=True)
+                
+                # Store execution result for learning
+                self.openclaw.store_execution_result(
+                    plan_source, command, actions, ok and not self._cancel_flag.is_set()
+                )
+                
                 if ok:
-                    msg = "Plan OpenClaw completado" if not self._cancel_flag.is_set() else "Cancelado"
+                    msg = f"Enhanced OpenClaw plan ({plan_source}) completado" if not self._cancel_flag.is_set() else "Cancelado"
                     self.root.after(0, lambda m=msg: self._finish_execution(m))
                     return
-                self.root.after(0, lambda: self._log(
-                    "  ⚠ OpenClaw falló — regresando a L2 local", self.YELLOW))
+                else:
+                    self.root.after(0, lambda: self._log(
+                        "  ⚠ Enhanced OpenClaw falló — regresando a L2 local", self.YELLOW))
             elif self.openclaw.last_error:
                 self.root.after(0, lambda e=self.openclaw.last_error: self._log(
-                    f"  ⚠ OpenClaw no disponible: {e}", self.YELLOW))
+                    f"  ⚠ Enhanced OpenClaw no disponible: {e}", self.YELLOW))
         except Exception as e:
-            self.root.after(0, lambda err=e: self._log(f"  ⚠ OpenClaw error: {err}", self.YELLOW))
+            self.root.after(0, lambda err=e: self._log(f"  ⚠ Enhanced OpenClaw error: {err}", self.YELLOW))
 
         try:
             result = self.brain.generate_plan(
@@ -1450,7 +1500,7 @@ class CecilApp:
 
         self.root.after(0, lambda: self.status_var.set("🧠 L3: Analizando pantalla..."))
         self.root.after(0, self.root.iconify)
-        time.sleep(0.5)
+        time.sleep(1.0) # Esperar más tiempo a que Hyprland restaure el focus a la app que hay debajo
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -1594,26 +1644,60 @@ class CecilApp:
             self.root.after(0, lambda: self._log("    ✘ Rechazado", self.YELLOW))
         return bool(confirmed)
 
-    def _execute_plan(self, actions: list, layer_tag: str, confirm_each: bool = False) -> bool:
-        """Execute a list of actions. Optionally require voice confirm per step."""
+    def _execute_plan(self, actions: list, layer_tag: str, confirm_plan: bool = False) -> bool:
+        """Execute a list of actions without manual confirmation ensuring mouse focus is correct."""
         self.root.after(0, lambda n=len(actions): self._log(
-            f"  📋 Plan ({layer_tag}): {n} acciones", self.MAUVE))
+            f"  📋 Plan ({layer_tag}): {n} acciones (Auto-ejecución)", self.MAUVE))
+
+        # Always hide the Assistant GUI instantly so it doesn't steal focus
+        self.root.after(0, self.root.iconify)
+        time.sleep(0.5)
+
+        import subprocess
+        import json
 
         for i, step in enumerate(actions):
             if self._cancel_flag.is_set():
                 self.root.after(0, lambda: self._log("  ⏹️ Cancelado", self.YELLOW))
                 return False
 
+            stype = step.get("type") or step.get("action", "")
+            
+            # --- ALGORITMO: Asegurar que el mouse está dentro de la ventana activa en acciones de teclado ---
+            if stype in ["key", "type"]:
+                try:
+                    # 1. Obtener ventana activa actual
+                    win_res = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2)
+                    win_data = json.loads(win_res.stdout) if win_res.stdout.strip() else {}
+                    
+                    if "at" in win_data and "size" in win_data:
+                        wx, wy = win_data["at"]
+                        ww, wh = win_data["size"]
+                        
+                        # 2. Obtener posición del mouse
+                        cur_res = subprocess.run(["hyprctl", "cursorpos", "-j"], capture_output=True, text=True, timeout=2)
+                        cur_data = json.loads(cur_res.stdout) if cur_res.stdout.strip() else {}
+                        
+                        mx, my = cur_data.get("x", 0), cur_data.get("y", 0)
+                        
+                        # 3. Comprobar si el mouse está FUERA de la ventana activa
+                        is_inside = (wx <= mx <= wx + ww) and (wy <= my <= wy + wh)
+                        
+                        if not is_inside:
+                            # Mover al centro para no perder el focus_follows_mouse de Wayland
+                            cx, cy = int(wx + ww / 2), int(wy + wh / 2)
+                            self.root.after(0, lambda: self._log("  🖱️ Auto-corrigiendo posición del mouse al centro de la app", self.SUBTEXT))
+                            self.executor.hover(cx, cy)
+                            time.sleep(0.2)
+                except Exception as e:
+                    pass # Si falla py-hyprctl, seguimos sin crashear el plan
+            # ------------------------------------------------------------------------------------------------
+
             desc = step.get("target", step.get("text",
-                   step.get("key_combo", step.get("type", "?"))))
-            stype = step.get("type", "")
+                   step.get("key_combo", step.get("type", step.get("action", "?")))))
+            
             self.root.after(0, lambda d=desc, n=i, t=stype: self._log(
                 f"    ▶ [{n+1}] {t}: {d}", self.MAUVE))
-
-            if confirm_each:
-                confirmed = self._voice_confirm_action(step, desc)
-                if not confirmed:
-                    return False
 
             ok = self._execute_llm_action(step)
 

@@ -124,7 +124,7 @@ class InputExecutor:
             logger.error("No input backend available for tap")
             return False
 
-    def type_text(self, text: str, target_class: str = "") -> bool:
+    def type_text(self, text: str, target_class: str = "", delay: float = 0.03) -> bool:
         """
         Simulate typing text into the focused window.
         If target_class is given, focus that window first.
@@ -132,6 +132,7 @@ class InputExecutor:
         Args:
             text: The text to type.
             target_class: Optional window class to focus first (e.g. "kitty", "firefox").
+            delay: Optional per-key delay in seconds (used by ydotool backend).
 
         Returns:
             True if successful.
@@ -141,12 +142,13 @@ class InputExecutor:
             time.sleep(0.3)
 
         logger.info(f"TYPE: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+        key_delay_ms = max(1, int(delay * 1000))
         # Prefer wtype on Wayland (handles unicode/locale correctly)
         if shutil.which("wtype"):
             return self._run_command(["wtype", text])
         elif self._backend == "ydotool":
             return self._run_command(
-                ["ydotool", "type", "--key-delay", "30", "--", text]
+                ["ydotool", "type", "--key-delay", str(key_delay_ms), "--", text]
             )
         elif self._backend == "xdotool":
             return self._run_command(["xdotool", "type", "--clearmodifiers", text])
@@ -564,3 +566,71 @@ class InputExecutor:
             return _json.loads(result.stdout)
         except Exception:
             return []
+
+    def get_cursor_pos(self) -> tuple[int, int]:
+        """Get current cursor position (x, y) using hyprctl."""
+        try:
+            import json as _json
+            result = subprocess.run(
+                ["hyprctl", "cursorpos", "-j"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pos = _json.loads(result.stdout)
+            return int(pos.get("x", 0)), int(pos.get("y", 0))
+        except Exception as e:
+            logger.error(f"get_cursor_pos error: {e}")
+            return (0, 0)
+
+    def move_mouse_humanly(self, target_x: int, target_y: int, max_duration: float = 0.5) -> bool:
+        """
+        Move mouse to (target_x, target_y) applying a deceleration curve (easing)
+        and slight randomness to mimic human movement.
+        """
+        if self._backend != "ydotool":
+            logger.warning("move_mouse_humanly preferred with ydotool, falling back to instant hover")
+            return self.hover(target_x, target_y)
+
+        start_x, start_y = self.get_cursor_pos()
+        if start_x == 0 and start_y == 0:
+            # Fallback if we couldn't get position
+            return self.hover(target_x, target_y)
+
+        logger.info(f"HUMAN MOVE from ({start_x},{start_y}) to ({target_x},{target_y})")
+
+        # Simple ease-out cubic interpolation
+        def ease_out_cubic(t: float) -> float:
+            return 1.0 - pow(1.0 - t, 3)
+
+        import random
+
+        steps = random.randint(15, 25)
+        # Avoid making it too slow if distance is short
+        distance = ((target_x - start_x)**2 + (target_y - start_y)**2)**0.5
+        if distance < 50:
+            steps = 5
+            max_duration = 0.1
+
+        sleep_time = max_duration / steps
+
+        for i in range(1, steps + 1):
+            t = i / steps
+            eased_t = ease_out_cubic(t)
+
+            # Apply small random jitter, decaying as it gets closer
+            jitter_scale = (1.0 - eased_t) * 10.0
+            jx = random.uniform(-jitter_scale, jitter_scale)
+            jy = random.uniform(-jitter_scale, jitter_scale)
+
+            # If it's the last step, remove jitter to ensure precision
+            if i == steps:
+                cx, cy = target_x, target_y
+            else:
+                cx = int(start_x + (target_x - start_x) * eased_t + jx)
+                cy = int(start_y + (target_y - start_y) * eased_t + jy)
+
+            self._run_command(
+                ["ydotool", "mousemove", "--absolute", "-x", str(cx), "-y", str(cy)]
+            )
+            time.sleep(sleep_time)
+
+        return True
